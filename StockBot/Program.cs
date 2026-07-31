@@ -4,7 +4,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,6 +14,7 @@ using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 using ScottPlot;
+using IOFile = System.IO.File;
 
 public class StockBot
 {
@@ -90,7 +90,7 @@ public class StockBot
     {
         if (File.Exists(DataFile))
         {
-            var json = File.ReadAllText(DataFile);
+            var json = IOFile.ReadAllText(DataFile);
             var data = JsonConvert.DeserializeObject<Dictionary<string, object>>(json);
             if (data != null)
             {
@@ -103,7 +103,7 @@ public class StockBot
     private static void SaveData()
     {
         var data = new { Market, Users };
-        File.WriteAllText(DataFile, JsonConvert.SerializeObject(data, Formatting.Indented));
+        IOFile.WriteAllText(DataFile, JsonConvert.SerializeObject(data, Formatting.Indented));
     }
 
     private static async Task HandleUpdateAsync(ITelegramBotClient bot, Update update, CancellationToken ct)
@@ -394,9 +394,9 @@ public class StockBot
                     string filePath = $"{symbol}_chart.png";
                     plt.SavePng(filePath, 800, 400);
 
-                    await using var stream = File.OpenRead(filePath);
+                    await using var stream = IOFile.OpenRead(filePath);
                     await bot.SendPhotoAsync(chatId, InputFile.FromStream(stream, filePath), caption: $"📊 چارت گرافیکی {symbol}", cancellationToken: ct);
-                    File.Delete(filePath);
+                    IOFile.Delete(filePath);
                 }
                 else
                 {
@@ -585,7 +585,7 @@ public class StockBot
         {
             try
             {
-                if (File.Exists(DataFile))
+                if (IOFile.Exists(DataFile))
                 {
                     await using var stream = File.OpenRead(DataFile);
                     await Bot.SendDocumentAsync(
