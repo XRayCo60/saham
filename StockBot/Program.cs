@@ -88,7 +88,7 @@ public class StockBot
 
     private static void LoadData()
     {
-        if (File.Exists(DataFile))
+        if (IOFile.Exists(DataFile))
         {
             var json = IOFile.ReadAllText(DataFile);
             var data = JsonConvert.DeserializeObject<Dictionary<string, object>>(json);
@@ -587,7 +587,7 @@ public class StockBot
             {
                 if (IOFile.Exists(DataFile))
                 {
-                    await using var stream = File.OpenRead(DataFile);
+                    await using var stream = IOFile.OpenRead(DataFile);
                     await Bot.SendDocumentAsync(
                         OwnerId,
                         InputFile.FromStream(stream, "stockbot_data.json"),
