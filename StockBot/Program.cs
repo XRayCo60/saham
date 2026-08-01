@@ -70,6 +70,7 @@ namespace StockBotApp
             // Referral
             public string ReferralCode { get; set; } = "";
             public int Referrals { get; set; } = 0;
+            public bool HasUsedReferral { get; set; } = false;
         }
 
         private static Dictionary<string, Currency> Market = new();
@@ -133,7 +134,8 @@ namespace StockBotApp
                     LastDailyReward TEXT,
                     PortfolioJson TEXT,
                     CostBasisJson TEXT,
-                    DeviceFingerprintsJson TEXT
+                    DeviceFingerprintsJson TEXT,
+                    HasUsedReferral INTEGER DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS Orders (
@@ -152,6 +154,13 @@ namespace StockBotApp
                 using var altCmd = conn.CreateCommand();
                 altCmd.CommandText = "ALTER TABLE Users ADD COLUMN CostBasisJson TEXT;";
                 altCmd.ExecuteNonQuery();
+            }
+            catch { }
+            try
+            {
+                using var altCmd2 = conn.CreateCommand();
+                altCmd2.CommandText = "ALTER TABLE Users ADD COLUMN HasUsedReferral INTEGER DEFAULT 0;";
+                altCmd2.ExecuteNonQuery();
             }
             catch { }
             return conn;
@@ -199,7 +208,8 @@ namespace StockBotApp
                     TotalProfit = u.TotalProfit,
                     CrisisSurvived = u.CrisisSurvived,
                     ReferralCode = u.ReferralCode,
-                    Referrals = u.Referrals
+                    Referrals = u.Referrals,
+                    HasUsedReferral = u.HasUsedReferral
                 }).ToList();
             }
 
@@ -301,8 +311,8 @@ namespace StockBotApp
                 using var insCmd = conn.CreateCommand();
                 insCmd.Transaction = trans;
                 insCmd.CommandText = @"
-                    INSERT OR REPLACE INTO Users (UserId, Username, Balance, Level, XP, TotalTrades, SuccessfulTrades, TotalProfit, CrisisSurvived, ReferralCode, Referrals, LastDailyReward, PortfolioJson, CostBasisJson, DeviceFingerprintsJson)
-                    VALUES (@uid, @un, @bal, @lvl, @xp, @tt, @st, @tp, @cs, @rc, @ref, @ldr, @port, @cb, @fp)";
+                    INSERT OR REPLACE INTO Users (UserId, Username, Balance, Level, XP, TotalTrades, SuccessfulTrades, TotalProfit, CrisisSurvived, ReferralCode, Referrals, LastDailyReward, PortfolioJson, CostBasisJson, DeviceFingerprintsJson, HasUsedReferral)
+                    VALUES (@uid, @un, @bal, @lvl, @xp, @tt, @st, @tp, @cs, @rc, @ref, @ldr, @port, @cb, @fp, @hur)";
                 insCmd.Parameters.AddWithValue("@uid", u.UserId);
                 insCmd.Parameters.AddWithValue("@un", u.Username ?? "unknown");
                 insCmd.Parameters.AddWithValue("@bal", u.Balance);
@@ -318,6 +328,7 @@ namespace StockBotApp
                 insCmd.Parameters.AddWithValue("@port", JsonConvert.SerializeObject(u.Portfolio));
                 insCmd.Parameters.AddWithValue("@cb", JsonConvert.SerializeObject(u.CostBasis));
                 insCmd.Parameters.AddWithValue("@fp", JsonConvert.SerializeObject(u.DeviceFingerprints));
+                insCmd.Parameters.AddWithValue("@hur", u.HasUsedReferral ? 1 : 0);
                 insCmd.ExecuteNonQuery();
             }
 
@@ -604,7 +615,7 @@ namespace StockBotApp
             // 3. لود کاربران
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText = "SELECT UserId, Username, Balance, Level, XP, TotalTrades, SuccessfulTrades, TotalProfit, CrisisSurvived, ReferralCode, Referrals, LastDailyReward, PortfolioJson, DeviceFingerprintsJson, CostBasisJson FROM Users";
+                cmd.CommandText = "SELECT UserId, Username, Balance, Level, XP, TotalTrades, SuccessfulTrades, TotalProfit, CrisisSurvived, ReferralCode, Referrals, LastDailyReward, PortfolioJson, DeviceFingerprintsJson, CostBasisJson, HasUsedReferral FROM Users";
                 using var reader = cmd.ExecuteReader();
                 while (reader.Read())
                 {
@@ -634,6 +645,11 @@ namespace StockBotApp
                     {
                         var cbJson = reader.GetString(14);
                         u.CostBasis = JsonConvert.DeserializeObject<Dictionary<string, decimal>>(cbJson) ?? new();
+                    }
+
+                    if (reader.FieldCount > 15 && !reader.IsDBNull(15))
+                    {
+                        u.HasUsedReferral = reader.GetInt32(15) == 1;
                     }
 
                     Users[userId] = u;
@@ -1634,8 +1650,9 @@ namespace StockBotApp
                     lock (_dataLock)
                     {
                         var referrer = Users.Values.FirstOrDefault(u => u.ReferralCode.Equals(code, StringComparison.OrdinalIgnoreCase));
-                        if (referrer != null && referrer.UserId != userId && user.Referrals == 0 && user.TotalTrades == 0)
+                        if (referrer != null && referrer.UserId != userId && !user.HasUsedReferral && user.TotalTrades == 0 && user.XP == 0 && user.Balance == 5000m)
                         {
+                            user.HasUsedReferral = true;
                             referrer.Balance += 500m;
                             referrer.Referrals++;
                             user.Balance += 200m;
@@ -1879,8 +1896,9 @@ namespace StockBotApp
                     lock (_dataLock)
                     {
                         var referrer = Users.Values.FirstOrDefault(u => u.ReferralCode.Equals(code, StringComparison.OrdinalIgnoreCase));
-                        if (referrer != null && referrer.UserId != userId && user.Referrals == 0 && user.TotalTrades == 0)
+                        if (referrer != null && referrer.UserId != userId && !user.HasUsedReferral && user.TotalTrades == 0 && user.XP == 0 && user.Balance == 5000m)
                         {
+                            user.HasUsedReferral = true;
                             referrer.Balance += 500m;
                             referrer.Referrals++;
                             user.Balance += 200m;
@@ -1899,7 +1917,7 @@ namespace StockBotApp
                     }
                     else
                     {
-                        await bot.SendMessage(chatId, "❌ کد دعوت نامعتبر است یا قبلاً استفاده شده.", replyMarkup: GetUserKeyboard(userId), cancellationToken: ct);
+                        await bot.SendMessage(chatId, "❌ خطا: کد دعوت نامعتبر است، یا شما قبلاً از کد دعوت استفاده کرده‌اید و کاربر جدید نیستید!", replyMarkup: GetUserKeyboard(userId), cancellationToken: ct);
                         return;
                     }
                 }
