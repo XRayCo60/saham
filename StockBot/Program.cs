@@ -2519,7 +2519,7 @@ namespace StockBotApp
             {
                 rows.Add(new[]
                 {
-                    InlineKeyboardButton.WithCallbackData($"💰 فروش P2P {h.Symbol}", $"LIMIT_SELL_INPUT_{h.Symbol}"),
+                    InlineKeyboardButton.WithCallbackData($"💰 فروش در تابلو {h.Symbol}", $"LIMIT_SELL_INPUT_{h.Symbol}"),
                     InlineKeyboardButton.WithCallbackData($"📋 تابلوی {h.Symbol}", $"BOARD_{h.Symbol}")
                 });
             }
@@ -2576,11 +2576,11 @@ namespace StockBotApp
                 new[]
                 {
                     InlineKeyboardButton.WithCallbackData("🛒 خرید فوری (از خزانه / تابلو)", $"BUY_MENU_{symbol}"),
-                    InlineKeyboardButton.WithCallbackData("💰 ثبت سفارش فروش P2P (تابلو)", $"LIMIT_SELL_INPUT_{symbol}")
+                    InlineKeyboardButton.WithCallbackData("💰 ثبت سفارش فروش (در تابلو)", $"LIMIT_SELL_INPUT_{symbol}")
                 },
                 new[]
                 {
-                    InlineKeyboardButton.WithCallbackData("📋 تابلوی معاملاتی لایو (بورس P2P)", $"BOARD_{symbol}")
+                    InlineKeyboardButton.WithCallbackData("📋 تابلوی معاملاتی لایو", $"BOARD_{symbol}")
                 },
                 new[]
                 {
@@ -2680,15 +2680,15 @@ namespace StockBotApp
 
         private static async Task SendSellMenuSelectorAsync(ITelegramBotClient bot, long chatId, CancellationToken ct)
         {
-            string msg = "💰 منوی انتخاب ارز برای ثبت سفارش فروش در تابلوی معاملاتی (بورس P2P):\n\n" +
-                         "در بازار همتا به همتا، سفارش فروش شما در تابلوی بورس (صف فروش) ثبت شده و توسط خریداران واقعی معامله می‌شود.\n" +
+            string msg = "💰 منوی انتخاب ارز برای ثبت سفارش فروش در تابلوی معاملاتی (بورس همتا به همتا):\n\n" +
+                         "سفارش فروش شما در تابلوی بورس (صف فروش) ثبت شده و توسط خریداران واقعی معامله می‌شود.\n" +
                          "لطفاً ارز مورد نظر را انتخاب کنید:";
 
             List<InlineKeyboardButton> symbolButtons;
             lock (_dataLock)
             {
                 symbolButtons = Market.Keys.Select(sym =>
-                    InlineKeyboardButton.WithCallbackData($"💰 فروش P2P {sym}", $"LIMIT_SELL_INPUT_{sym}")
+                    InlineKeyboardButton.WithCallbackData($"💰 فروش در تابلو {sym}", $"LIMIT_SELL_INPUT_{sym}")
                 ).ToList();
             }
 
@@ -2978,8 +2978,8 @@ namespace StockBotApp
                             if (buy.UserId != 0 && sell.UserId != 0)
                             {
                                 UpdateUserStats(buyer, seller);
-                                string buyMsg = $"🎉 معامله P2P موفق!\nشما {matchQty:N0} واحد {symbol} را به قیمت واحد {FmtPrice(tradePrice)} از @{seller.Username} خریداری کردید!\n💰 موجودی جدید دلار شما: {FmtMoney(buyer.Balance)}";
-                                string sellMsg = $"🎉 معامله P2P موفق!\nتعداد {matchQty:N0} واحد از سهام {symbol} شما به قیمت واحد {FmtPrice(tradePrice)} توسط @{buyer.Username} خریداری شد!\n💰 مبلغ دریافتی با کسر کارمزد: {FmtMoney((tradePrice * matchQty) * 0.99m)}\n💵 موجودی جدید دلار شما: {FmtMoney(seller.Balance)}";
+                                string buyMsg = $"🤝 سفارش شما در تابلوی معاملاتی انجام شد!\nشما {matchQty:N0} واحد {symbol} را به قیمت واحد {FmtPrice(tradePrice)} از تابلوی بورس خریداری کردید!\n💰 موجودی جدید دلار شما: {FmtMoney(buyer.Balance)}";
+                                string sellMsg = $"🤝 سفارش شما در تابلوی معاملاتی انجام شد!\nتعداد {matchQty:N0} واحد از سهام {symbol} شما به قیمت واحد {FmtPrice(tradePrice)} در تابلوی بورس به فروش رسید!\n💰 مبلغ دریافتی با کسر کارمزد: {FmtMoney((tradePrice * matchQty) * 0.99m)}\n💵 موجودی جدید دلار شما: {FmtMoney(seller.Balance)}";
 
                                 try { _ = Bot.SendMessage(buyer.UserId, buyMsg); } catch { }
                                 try { _ = Bot.SendMessage(seller.UserId, sellMsg); } catch { }
