@@ -1,12 +1,14 @@
-// StockBot.cs - Naomi (نائومی) Telegram Trading Bot (No Slash Commands + Complete Interactive UI)
+// StockBot.cs - Naomi (نائومی) Telegram Trading Bot with Ultra-Fast SQLite Database (WAL Mode)
 // تک‌فایل C# کامل - بدون هیچ دستوری که با / شروع شود
-// پشتیبانی کامل از دکمه‌های شیشه‌ای، چارت گرافیکی ScottPlot، نمایش دلار ($) بدون اعشار اضافی، نقدینگی اولیه و سرعت فوق‌العاده بالا
+// مجهز به دیتابیس پرسرعت SQLite خارج از مسیر مخزن، حفاظت دائمی از اطلاعات بعد از ریستارت و معماری بدون تاخیر
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
 using Telegram.Bot;
 using Telegram.Bot.Polling;
@@ -71,7 +73,10 @@ namespace StockBotApp
         private static Dictionary<string, Currency> Market = new();
         private static Dictionary<long, User> Users = new();
         private static Dictionary<long, string> UserStates = new();
-        private static readonly string DataFile = "stockbot_data.json";
+
+        // مسیر دیتابیس SQLite در دایرکتوری کاربر (خارج از مخزن کلون‌شده) تا پس از rm -rf Naomi هرگز پاک نشود
+        private static readonly string DbPath = Environment.GetEnvironmentVariable("NAOMI_DB_PATH") ??
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "naomi_data.db");
 
         private static readonly object _dataLock = new();
         private static volatile bool _saveRequested = false;
@@ -84,17 +89,161 @@ namespace StockBotApp
             _saveRequested = true;
         }
 
-        private static void SaveDataImmediate()
+        private static SqliteConnection GetDbConnection()
+        {
+            var conn = new SqliteConnection($"Data Source={DbPath};");
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                PRAGMA journal_mode=WAL;
+                PRAGMA synchronous=NORMAL;
+
+                CREATE TABLE IF NOT EXISTS Settings (
+                    Key TEXT PRIMARY KEY,
+                    Value TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS Currencies (
+                    Symbol TEXT PRIMARY KEY,
+                    Description TEXT,
+                    BaseValue REAL,
+                    TotalSupply INTEGER,
+                    CirculatingSupply INTEGER,
+                    PhotoUrl TEXT,
+                    PriceHistoryJson TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS Users (
+                    UserId INTEGER PRIMARY KEY,
+                    Username TEXT,
+                    Balance REAL,
+                    Level INTEGER,
+                    XP INTEGER,
+                    TotalTrades INTEGER,
+                    SuccessfulTrades INTEGER,
+                    TotalProfit REAL,
+                    CrisisSurvived INTEGER,
+                    ReferralCode TEXT,
+                    Referrals INTEGER,
+                    LastDailyReward TEXT,
+                    PortfolioJson TEXT,
+                    DeviceFingerprintsJson TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS Orders (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    Symbol TEXT,
+                    UserId INTEGER,
+                    Type TEXT,
+                    Price REAL,
+                    Quantity INTEGER,
+                    Timestamp TEXT
+                );
+            ";
+            cmd.ExecuteNonQuery();
+            return conn;
+        }
+
+        private static void SaveToSqliteImmediate()
         {
             try
             {
                 lock (_dataLock)
                 {
-                    var data = new { Market, Users };
-                    IOFile.WriteAllText(DataFile, JsonConvert.SerializeObject(data, Formatting.Indented));
+                    using var conn = GetDbConnection();
+                    using var trans = conn.BeginTransaction();
+
+                    // 1. ذخیره ارزها
+                    using (var delCmd = conn.CreateCommand())
+                    {
+                        delCmd.Transaction = trans;
+                        delCmd.CommandText = "DELETE FROM Currencies";
+                        delCmd.ExecuteNonQuery();
+                    }
+
+                    foreach (var c in Market.Values)
+                    {
+                        using var insCmd = conn.CreateCommand();
+                        insCmd.Transaction = trans;
+                        insCmd.CommandText = @"
+                            INSERT OR REPLACE INTO Currencies (Symbol, Description, BaseValue, TotalSupply, CirculatingSupply, PhotoUrl, PriceHistoryJson)
+                            VALUES (@s, @d, @bv, @ts, @cs, @pu, @ph)";
+                        insCmd.Parameters.AddWithValue("@s", c.Symbol);
+                        insCmd.Parameters.AddWithValue("@d", c.Description ?? c.Symbol);
+                        insCmd.Parameters.AddWithValue("@bv", c.BaseValue);
+                        insCmd.Parameters.AddWithValue("@ts", c.TotalSupply);
+                        insCmd.Parameters.AddWithValue("@cs", c.CirculatingSupply);
+                        insCmd.Parameters.AddWithValue("@pu", c.PhotoUrl ?? "");
+                        insCmd.Parameters.AddWithValue("@ph", JsonConvert.SerializeObject(c.PriceHistory));
+                        insCmd.ExecuteNonQuery();
+                    }
+
+                    // 2. ذخیره سفارشات
+                    using (var delCmd = conn.CreateCommand())
+                    {
+                        delCmd.Transaction = trans;
+                        delCmd.CommandText = "DELETE FROM Orders";
+                        delCmd.ExecuteNonQuery();
+                    }
+
+                    foreach (var c in Market.Values)
+                    {
+                        foreach (var o in c.Orders)
+                        {
+                            using var insCmd = conn.CreateCommand();
+                            insCmd.Transaction = trans;
+                            insCmd.CommandText = @"
+                                INSERT INTO Orders (Symbol, UserId, Type, Price, Quantity, Timestamp)
+                                VALUES (@sym, @u, @t, @p, @q, @ts)";
+                            insCmd.Parameters.AddWithValue("@sym", c.Symbol);
+                            insCmd.Parameters.AddWithValue("@u", o.UserId);
+                            insCmd.Parameters.AddWithValue("@t", o.Type ?? "SELL");
+                            insCmd.Parameters.AddWithValue("@p", o.Price);
+                            insCmd.Parameters.AddWithValue("@q", o.Quantity);
+                            insCmd.Parameters.AddWithValue("@ts", o.Timestamp.ToString("o"));
+                            insCmd.ExecuteNonQuery();
+                        }
+                    }
+
+                    // 3. ذخیره کاربران
+                    using (var delCmd = conn.CreateCommand())
+                    {
+                        delCmd.Transaction = trans;
+                        delCmd.CommandText = "DELETE FROM Users";
+                        delCmd.ExecuteNonQuery();
+                    }
+
+                    foreach (var u in Users.Values)
+                    {
+                        using var insCmd = conn.CreateCommand();
+                        insCmd.Transaction = trans;
+                        insCmd.CommandText = @"
+                            INSERT OR REPLACE INTO Users (UserId, Username, Balance, Level, XP, TotalTrades, SuccessfulTrades, TotalProfit, CrisisSurvived, ReferralCode, Referrals, LastDailyReward, PortfolioJson, DeviceFingerprintsJson)
+                            VALUES (@uid, @un, @bal, @lvl, @xp, @tt, @st, @tp, @cs, @rc, @ref, @ldr, @port, @fp)";
+                        insCmd.Parameters.AddWithValue("@uid", u.UserId);
+                        insCmd.Parameters.AddWithValue("@un", u.Username ?? "unknown");
+                        insCmd.Parameters.AddWithValue("@bal", u.Balance);
+                        insCmd.Parameters.AddWithValue("@lvl", u.Level);
+                        insCmd.Parameters.AddWithValue("@xp", u.XP);
+                        insCmd.Parameters.AddWithValue("@tt", u.TotalTrades);
+                        insCmd.Parameters.AddWithValue("@st", u.SuccessfulTrades);
+                        insCmd.Parameters.AddWithValue("@tp", u.TotalProfit);
+                        insCmd.Parameters.AddWithValue("@cs", u.CrisisSurvived);
+                        insCmd.Parameters.AddWithValue("@rc", u.ReferralCode ?? ("REF" + u.UserId));
+                        insCmd.Parameters.AddWithValue("@ref", u.Referrals);
+                        insCmd.Parameters.AddWithValue("@ldr", u.LastDailyReward.ToString("o"));
+                        insCmd.Parameters.AddWithValue("@port", JsonConvert.SerializeObject(u.Portfolio));
+                        insCmd.Parameters.AddWithValue("@fp", JsonConvert.SerializeObject(u.DeviceFingerprints));
+                        insCmd.ExecuteNonQuery();
+                    }
+
+                    trans.Commit();
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"SQLite save error: {ex.Message}");
+            }
         }
 
         private static async Task BackgroundSaveWorker(CancellationToken ct)
@@ -106,7 +255,7 @@ namespace StockBotApp
                     if (_saveRequested)
                     {
                         _saveRequested = false;
-                        SaveDataImmediate();
+                        SaveToSqliteImmediate();
                     }
                 }
                 catch { }
@@ -124,16 +273,16 @@ namespace StockBotApp
 
             var me = await Bot.GetMe();
             BotUsername = me.Username ?? "NaomiBot";
-            Console.WriteLine($"Naomi Bot started successfully: @{BotUsername}");
+            Console.WriteLine($"Naomi Bot started successfully: @{BotUsername} | DB: {DbPath}");
 
             var cts = new CancellationTokenSource();
             AppDomain.CurrentDomain.ProcessExit += (s, e) => {
-                SaveDataImmediate();
+                SaveToSqliteImmediate();
                 cts.Cancel();
             };
             Console.CancelKeyPress += (s, e) => {
                 e.Cancel = true;
-                SaveDataImmediate();
+                SaveToSqliteImmediate();
                 cts.Cancel();
             };
 
@@ -144,18 +293,29 @@ namespace StockBotApp
             var receiverOptions = new ReceiverOptions { AllowedUpdates = Array.Empty<UpdateType>() };
             Bot.StartReceiving(HandleUpdateAsync, HandleErrorAsync, receiverOptions, cts.Token);
 
-            Console.WriteLine("Naomi is running in background/daemon mode. Press Ctrl+C to stop...");
+            Console.WriteLine("Naomi is running with SQLite WAL mode. Press Ctrl+C to stop...");
             try { await Task.Delay(-1, cts.Token); } catch { }
-            SaveDataImmediate();
+            SaveToSqliteImmediate();
         }
 
         private static void LoadData()
         {
-            if (IOFile.Exists(DataFile))
+            using var conn = GetDbConnection();
+
+            bool isInitialized = false;
+            using (var checkCmd = conn.CreateCommand())
+            {
+                checkCmd.CommandText = "SELECT Value FROM Settings WHERE Key = 'IsInitialized'";
+                var val = checkCmd.ExecuteScalar()?.ToString();
+                isInitialized = (val == "true");
+            }
+
+            // مهاجرت خودکار از فایل قدیمی JSON در صورت وجود
+            if (!isInitialized && IOFile.Exists("stockbot_data.json"))
             {
                 try
                 {
-                    var json = IOFile.ReadAllText(DataFile);
+                    var json = IOFile.ReadAllText("stockbot_data.json");
                     var data = JsonConvert.DeserializeObject<Dictionary<string, object>>(json);
                     if (data != null)
                     {
@@ -170,12 +330,29 @@ namespace StockBotApp
                             if (u != null) Users = u;
                         }
                     }
+                    try { IOFile.Move("stockbot_data.json", "stockbot_data.json.migrated"); } catch { }
                 }
                 catch { }
+            }
+            else
+            {
+                LoadFromSqlite(conn);
             }
 
             if (Market == null) Market = new();
             if (Users == null) Users = new();
+
+            EnsureTreasuryAccount();
+
+            // ارزهای پیش‌فرض فقط و فقط در اولین راه‌اندازی دیتابیس ایجاد می‌شوند و در ریستارت‌های بعدی بازنمی‌گردند
+            if (!isInitialized)
+            {
+                EnsureDefaultCurrencies();
+                using var initCmd = conn.CreateCommand();
+                initCmd.CommandText = "INSERT OR REPLACE INTO Settings (Key, Value) VALUES ('IsInitialized', 'true')";
+                initCmd.ExecuteNonQuery();
+                SaveToSqliteImmediate();
+            }
 
             // پاک‌سازی دیتابیس از مقادیر null
             foreach (var c in Market.Values)
@@ -195,9 +372,90 @@ namespace StockBotApp
                 if (u.DeviceFingerprints == null) u.DeviceFingerprints = new();
                 if (u.ReferralCode == null) u.ReferralCode = "REF" + u.UserId;
             }
+        }
 
-            EnsureTreasuryAccount();
-            EnsureDefaultCurrencies();
+        private static void LoadFromSqlite(SqliteConnection conn)
+        {
+            Market.Clear();
+            Users.Clear();
+
+            // 1. لود ارزها
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT Symbol, Description, BaseValue, TotalSupply, CirculatingSupply, PhotoUrl, PriceHistoryJson FROM Currencies";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    var symbol = reader.GetString(0);
+                    var c = new Currency
+                    {
+                        Symbol = symbol,
+                        Description = reader.IsDBNull(1) ? symbol : reader.GetString(1),
+                        BaseValue = reader.GetDecimal(2),
+                        TotalSupply = reader.GetInt64(3),
+                        CirculatingSupply = reader.GetInt64(4),
+                        PhotoUrl = reader.IsDBNull(5) ? "" : reader.GetString(5)
+                    };
+                    var histJson = reader.IsDBNull(6) ? "[]" : reader.GetString(6);
+                    c.PriceHistory = JsonConvert.DeserializeObject<List<decimal>>(histJson) ?? new List<decimal> { c.BaseValue };
+                    Market[symbol] = c;
+                }
+            }
+
+            // 2. لود سفارشات
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT Symbol, UserId, Type, Price, Quantity, Timestamp FROM Orders";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    var symbol = reader.GetString(0);
+                    if (Market.TryGetValue(symbol, out var c))
+                    {
+                        c.Orders.Add(new Order
+                        {
+                            UserId = reader.GetInt64(1),
+                            Type = reader.GetString(2),
+                            Price = reader.GetDecimal(3),
+                            Quantity = reader.GetInt64(4),
+                            Timestamp = DateTime.TryParse(reader.GetString(5), out var dt) ? dt : DateTime.UtcNow
+                        });
+                    }
+                }
+            }
+
+            // 3. لود کاربران
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT UserId, Username, Balance, Level, XP, TotalTrades, SuccessfulTrades, TotalProfit, CrisisSurvived, ReferralCode, Referrals, LastDailyReward, PortfolioJson, DeviceFingerprintsJson FROM Users";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    var userId = reader.GetInt64(0);
+                    var u = new User
+                    {
+                        UserId = userId,
+                        Username = reader.IsDBNull(1) ? "unknown" : reader.GetString(1),
+                        Balance = reader.GetDecimal(2),
+                        Level = reader.GetInt32(3),
+                        XP = reader.GetInt32(4),
+                        TotalTrades = reader.GetInt32(5),
+                        SuccessfulTrades = reader.GetInt32(6),
+                        TotalProfit = reader.GetDecimal(7),
+                        CrisisSurvived = reader.GetInt32(8),
+                        ReferralCode = reader.IsDBNull(9) ? ("REF" + userId) : reader.GetString(9),
+                        Referrals = reader.GetInt32(10),
+                        LastDailyReward = DateTime.TryParse(reader.IsDBNull(11) ? "" : reader.GetString(11), out var dr) ? dr : DateTime.MinValue
+                    };
+                    var portJson = reader.IsDBNull(12) ? "{}" : reader.GetString(12);
+                    u.Portfolio = JsonConvert.DeserializeObject<Dictionary<string, long>>(portJson) ?? new();
+
+                    var fpJson = reader.IsDBNull(13) ? "[]" : reader.GetString(13);
+                    u.DeviceFingerprints = JsonConvert.DeserializeObject<List<long>>(fpJson) ?? new();
+
+                    Users[userId] = u;
+                }
+            }
         }
 
         private static void EnsureTreasuryAccount()
@@ -1607,13 +1865,13 @@ namespace StockBotApp
                 try
                 {
                     await Task.Delay(TimeSpan.FromHours(6));
-                    if (IOFile.Exists(DataFile))
+                    if (IOFile.Exists(DbPath))
                     {
-                        await using var stream = IOFile.OpenRead(DataFile);
+                        await using var stream = IOFile.OpenRead(DbPath);
                         await Bot.SendDocument(
                             OwnerId,
-                            InputFile.FromStream(stream, "stockbot_data.json"),
-                            caption: $"📦 بک‌آپ خودکار دیتابیس - {DateTime.Now:yyyy-MM-dd HH:mm}"
+                            InputFile.FromStream(stream, "naomi_data.db"),
+                            caption: $"📦 بک‌آپ خودکار دیتابیس SQLite نائومی — {DateTime.Now:yyyy-MM-dd HH:mm}"
                         );
                     }
                 }
