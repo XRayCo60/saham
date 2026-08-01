@@ -85,8 +85,8 @@ namespace StockBotApp
         private static readonly object _dataLock = new();
         private static volatile bool _saveRequested = false;
 
-        public static string FmtMoney(decimal amount) => amount == Math.Floor(amount) ? $"${amount:N0}" : $"${amount:0.##}";
-        public static string FmtPrice(decimal price) => price == Math.Floor(price) ? $"${price:N0}" : $"${price:0.##}";
+        public static string FmtMoney(decimal amount) => amount == Math.Floor(amount) ? $"${amount:N0}" : $"${amount:#,##0.##}";
+        public static string FmtPrice(decimal price) => price == Math.Floor(price) ? $"${price:N0}" : $"${price:#,##0.##}";
 
         private static void RequestSave()
         {
