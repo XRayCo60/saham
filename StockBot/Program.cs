@@ -2946,7 +2946,7 @@ namespace StockBotApp
                             if (buy.UserId != 0)
                             {
                                 decimal batchCost = (tradePrice * matchQty) + tax;
-                                long oldQty = buyer.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                                long oldQty = buyer.Portfolio.TryGetValue(symbol, out var bq) ? bq : 0;
                                 decimal oldBasis = buyer.CostBasis.TryGetValue(symbol, out var cb) ? cb : tradePrice;
                                 decimal oldTotalInvested = oldQty * oldBasis;
 
