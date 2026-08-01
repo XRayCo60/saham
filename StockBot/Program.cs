@@ -28,6 +28,12 @@ namespace StockBotApp
         private static ITelegramBotClient Bot = null!;
         public static string BotUsername = "NaomiBot";
 
+        public class PricePoint
+        {
+            public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+            public decimal Price { get; set; }
+        }
+
         public class Currency
         {
             public string Symbol { get; set; } = "";
@@ -36,8 +42,10 @@ namespace StockBotApp
             public long CirculatingSupply { get; set; }
             public string PhotoUrl { get; set; } = "";
             public string Description { get; set; } = "";
+            public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
             public List<Order> Orders { get; set; } = new();
             public List<decimal> PriceHistory { get; set; } = new();
+            public List<PricePoint> TimedPriceHistory { get; set; } = new();
         }
 
         public class Order
@@ -90,6 +98,28 @@ namespace StockBotApp
         public static string FmtMoney(decimal amount) => amount == Math.Floor(amount) ? $"${amount:N0}" : $"${amount:#,##0.##}";
         public static string FmtPrice(decimal price) => price == Math.Floor(price) ? $"${price:N0}" : $"${price:#,##0.##}";
 
+        public static string GetShamsiTehranTime(DateTime utcDate)
+        {
+            try
+            {
+                var tehranTz = TimeZoneInfo.FindSystemTimeZoneById("Iran Standard Time");
+                var tehranDate = TimeZoneInfo.ConvertTimeFromUtc(utcDate, tehranTz);
+                var pc = new System.Globalization.PersianCalendar();
+                int year = pc.GetYear(tehranDate);
+                int month = pc.GetMonth(tehranDate);
+                int day = pc.GetDayOfMonth(tehranDate);
+
+                string[] monthNames = { "", "فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور", "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند" };
+                string mName = month >= 1 && month <= 12 ? monthNames[month] : month.ToString();
+
+                return $"{day} {mName} {year} - ساعت {tehranDate:HH:mm} تهران";
+            }
+            catch
+            {
+                return utcDate.ToString("yyyy-MM-dd HH:mm UTC");
+            }
+        }
+
         private static void RequestSave()
         {
             _saveRequested = true;
@@ -116,7 +146,9 @@ namespace StockBotApp
                     TotalSupply INTEGER,
                     CirculatingSupply INTEGER,
                     PhotoUrl TEXT,
-                    PriceHistoryJson TEXT
+                    PriceHistoryJson TEXT,
+                    CreatedAt TEXT,
+                    TimedPriceHistoryJson TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS Users (
@@ -163,6 +195,20 @@ namespace StockBotApp
                 altCmd2.ExecuteNonQuery();
             }
             catch { }
+            try
+            {
+                using var altCmd3 = conn.CreateCommand();
+                altCmd3.CommandText = "ALTER TABLE Currencies ADD COLUMN CreatedAt TEXT;";
+                altCmd3.ExecuteNonQuery();
+            }
+            catch { }
+            try
+            {
+                using var altCmd4 = conn.CreateCommand();
+                altCmd4.CommandText = "ALTER TABLE Currencies ADD COLUMN TimedPriceHistoryJson TEXT;";
+                altCmd4.ExecuteNonQuery();
+            }
+            catch { }
             return conn;
         }
 
@@ -181,7 +227,9 @@ namespace StockBotApp
                     TotalSupply = c.TotalSupply,
                     CirculatingSupply = c.CirculatingSupply,
                     PhotoUrl = c.PhotoUrl,
+                    CreatedAt = c.CreatedAt,
                     PriceHistory = new List<decimal>(c.PriceHistory),
+                    TimedPriceHistory = new List<PricePoint>(c.TimedPriceHistory),
                     Orders = c.Orders.Select(o => new Order
                     {
                         UserId = o.UserId,
@@ -261,8 +309,8 @@ namespace StockBotApp
                 using var insCmd = conn.CreateCommand();
                 insCmd.Transaction = trans;
                 insCmd.CommandText = @"
-                    INSERT OR REPLACE INTO Currencies (Symbol, Description, BaseValue, TotalSupply, CirculatingSupply, PhotoUrl, PriceHistoryJson)
-                    VALUES (@s, @d, @bv, @ts, @cs, @pu, @ph)";
+                    INSERT OR REPLACE INTO Currencies (Symbol, Description, BaseValue, TotalSupply, CirculatingSupply, PhotoUrl, PriceHistoryJson, CreatedAt, TimedPriceHistoryJson)
+                    VALUES (@s, @d, @bv, @ts, @cs, @pu, @ph, @ca, @tph)";
                 insCmd.Parameters.AddWithValue("@s", c.Symbol);
                 insCmd.Parameters.AddWithValue("@d", c.Description ?? c.Symbol);
                 insCmd.Parameters.AddWithValue("@bv", c.BaseValue);
@@ -270,6 +318,8 @@ namespace StockBotApp
                 insCmd.Parameters.AddWithValue("@cs", c.CirculatingSupply);
                 insCmd.Parameters.AddWithValue("@pu", c.PhotoUrl ?? "");
                 insCmd.Parameters.AddWithValue("@ph", JsonConvert.SerializeObject(c.PriceHistory));
+                insCmd.Parameters.AddWithValue("@ca", c.CreatedAt.ToString("o"));
+                insCmd.Parameters.AddWithValue("@tph", JsonConvert.SerializeObject(c.TimedPriceHistory));
                 insCmd.ExecuteNonQuery();
             }
 
@@ -570,7 +620,7 @@ namespace StockBotApp
             // 1. لود ارزها
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText = "SELECT Symbol, Description, BaseValue, TotalSupply, CirculatingSupply, PhotoUrl, PriceHistoryJson FROM Currencies";
+                cmd.CommandText = "SELECT Symbol, Description, BaseValue, TotalSupply, CirculatingSupply, PhotoUrl, PriceHistoryJson, CreatedAt, TimedPriceHistoryJson FROM Currencies";
                 using var reader = cmd.ExecuteReader();
                 while (reader.Read())
                 {
@@ -586,6 +636,33 @@ namespace StockBotApp
                     };
                     var histJson = reader.IsDBNull(6) ? "[]" : reader.GetString(6);
                     c.PriceHistory = JsonConvert.DeserializeObject<List<decimal>>(histJson) ?? new List<decimal> { c.BaseValue };
+
+                    if (reader.FieldCount > 7 && !reader.IsDBNull(7))
+                    {
+                        if (DateTime.TryParse(reader.GetString(7), out var ca))
+                            c.CreatedAt = ca;
+                    }
+                    if (c.CreatedAt == DateTime.MinValue)
+                        c.CreatedAt = DateTime.UtcNow.AddDays(-7);
+
+                    if (reader.FieldCount > 8 && !reader.IsDBNull(8))
+                    {
+                        var tphJson = reader.GetString(8);
+                        c.TimedPriceHistory = JsonConvert.DeserializeObject<List<PricePoint>>(tphJson) ?? new();
+                    }
+
+                    if (c.TimedPriceHistory == null || c.TimedPriceHistory.Count == 0)
+                    {
+                        c.TimedPriceHistory = new List<PricePoint>();
+                        var startDt = c.CreatedAt;
+                        for (int i = 0; i < c.PriceHistory.Count; i++)
+                        {
+                            var dt = startDt.AddHours(i * 4);
+                            if (dt > DateTime.UtcNow) dt = DateTime.UtcNow;
+                            c.TimedPriceHistory.Add(new PricePoint { Timestamp = dt, Price = c.PriceHistory[i] });
+                        }
+                    }
+
                     Market[symbol] = c;
                 }
             }
@@ -699,9 +776,12 @@ namespace StockBotApp
                     BaseValue = baseValue,
                     TotalSupply = totalSupply,
                     CirculatingSupply = totalSupply / 2,
-                    PhotoUrl = photoUrl
+                    PhotoUrl = photoUrl,
+                    CreatedAt = DateTime.UtcNow.AddDays(-14)
                 };
                 currency.PriceHistory.Add(baseValue);
+                currency.TimedPriceHistory.Add(new PricePoint { Timestamp = DateTime.UtcNow.AddDays(-14), Price = baseValue });
+                currency.TimedPriceHistory.Add(new PricePoint { Timestamp = DateTime.UtcNow, Price = baseValue });
                 Market[symbol] = currency;
             }
         }
@@ -2020,10 +2100,17 @@ namespace StockBotApp
                     }
                 }
             }
+            else if (data.StartsWith("CHART_TF_"))
+            {
+                var parts = data.Split('_');
+                var symbol = parts[2];
+                var tf = parts[3];
+                await SendGraphicChartAsync(bot, chatId, symbol, tf, ct);
+            }
             else if (data.StartsWith("CHART_"))
             {
                 var symbol = data.Split('_')[1];
-                await SendGraphicChartAsync(bot, chatId, symbol, ct);
+                await SendGraphicChartAsync(bot, chatId, symbol, "ALL", ct);
             }
             else if (data.StartsWith("LIMIT_BUY_INPUT_"))
             {
@@ -2746,11 +2833,79 @@ namespace StockBotApp
             await bot.SendMessage(chatId, msg, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
         }
 
-        private static async Task SendGraphicChartAsync(ITelegramBotClient bot, long chatId, string symbol, CancellationToken ct)
+        private static Task SendGraphicChartAsync(ITelegramBotClient bot, long chatId, string symbol, CancellationToken ct)
+        {
+            return SendGraphicChartAsync(bot, chatId, symbol, "ALL", ct);
+        }
+
+        private static InlineKeyboardMarkup GetChartTimeframeKeyboard(string symbol)
+        {
+            double ageHours = 0;
+            lock (_dataLock)
+            {
+                if (Market.TryGetValue(symbol, out var c))
+                {
+                    if (c.CreatedAt == DateTime.MinValue) c.CreatedAt = DateTime.UtcNow.AddDays(-14);
+                    ageHours = (DateTime.UtcNow - c.CreatedAt).TotalHours;
+                }
+            }
+
+            var buttons = new List<InlineKeyboardButton>();
+
+            // ۳ ساعت اخیر همیشه نمایش داده می‌شود
+            buttons.Add(InlineKeyboardButton.WithCallbackData("۳ ساعت اخیر", $"CHART_TF_{symbol}_3H"));
+
+            // نمایش تا حداکثر عمر واقعی ارز
+            if (ageHours >= 3.0)
+                buttons.Add(InlineKeyboardButton.WithCallbackData("۱۲ ساعت اخیر", $"CHART_TF_{symbol}_12H"));
+
+            if (ageHours >= 12.0)
+                buttons.Add(InlineKeyboardButton.WithCallbackData("۲۴ ساعت اخیر", $"CHART_TF_{symbol}_24H"));
+
+            if (ageHours >= 24.0)
+                buttons.Add(InlineKeyboardButton.WithCallbackData("۳ روز اخیر", $"CHART_TF_{symbol}_3D"));
+
+            if (ageHours >= 72.0)
+                buttons.Add(InlineKeyboardButton.WithCallbackData("۷ روز اخیر", $"CHART_TF_{symbol}_7D"));
+
+            if (ageHours >= 168.0)
+                buttons.Add(InlineKeyboardButton.WithCallbackData("۳۰ روز اخیر", $"CHART_TF_{symbol}_30D"));
+
+            buttons.Add(InlineKeyboardButton.WithCallbackData("کل تاریخچه", $"CHART_TF_{symbol}_ALL"));
+
+            var rows = new List<InlineKeyboardButton[]>();
+            for (int i = 0; i < buttons.Count; i += 2)
+            {
+                if (i + 1 < buttons.Count)
+                    rows.Add(new[] { buttons[i], buttons[i + 1] });
+                else
+                    rows.Add(new[] { buttons[i] });
+            }
+
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🔙 بازگشت به صفحه ارز", $"VIEW_SYMBOL_{symbol}") });
+
+            return new InlineKeyboardMarkup(rows);
+        }
+
+        private static async Task SendGraphicChartAsync(ITelegramBotClient bot, long chatId, string symbol, string timeframe, CancellationToken ct)
         {
             decimal[] prices;
             decimal baseValue;
             decimal curPrice;
+            string tfTitle = "کل تاریخچه";
+            DateTime minTime = DateTime.MinValue;
+
+            switch (timeframe.ToUpper())
+            {
+                case "3H": minTime = DateTime.UtcNow.AddHours(-3); tfTitle = "۳ ساعت اخیر"; break;
+                case "12H": minTime = DateTime.UtcNow.AddHours(-12); tfTitle = "۱۲ ساعت اخیر"; break;
+                case "24H": minTime = DateTime.UtcNow.AddHours(-24); tfTitle = "۲۴ ساعت اخیر"; break;
+                case "3D": minTime = DateTime.UtcNow.AddDays(-3); tfTitle = "۳ روز اخیر"; break;
+                case "7D": minTime = DateTime.UtcNow.AddDays(-7); tfTitle = "۷ روز اخیر"; break;
+                case "30D": minTime = DateTime.UtcNow.AddDays(-30); tfTitle = "۳۰ روز اخیر"; break;
+                default: minTime = DateTime.MinValue; tfTitle = "کل تاریخچه"; break;
+            }
+
             lock (_dataLock)
             {
                 if (!Market.TryGetValue(symbol, out var c))
@@ -2761,10 +2916,18 @@ namespace StockBotApp
                 }
                 else
                 {
-                    prices = c.PriceHistory.TakeLast(30).ToArray();
-                    if (prices.Length == 0) prices = new[] { c.BaseValue };
                     baseValue = c.BaseValue;
                     curPrice = GetCurrentPrice(symbol);
+                    var subset = c.TimedPriceHistory.Where(p => p.Timestamp >= minTime).Select(p => p.Price).ToList();
+                    if (subset.Count == 0)
+                    {
+                        subset = c.PriceHistory.TakeLast(30).ToList();
+                    }
+                    if (subset.Count == 1)
+                    {
+                        subset.Insert(0, c.BaseValue);
+                    }
+                    prices = subset.ToArray();
                 }
             }
 
@@ -2773,6 +2936,12 @@ namespace StockBotApp
                 await bot.SendMessage(chatId, $"❌ ارز {symbol} یافت نشد.", cancellationToken: ct);
                 return;
             }
+
+            decimal startPrice = prices.First();
+            decimal changePct = startPrice > 0 ? ((curPrice - startPrice) / startPrice) * 100m : 0m;
+            string changeIcon = changePct >= 0 ? "🟢" : "🔴";
+            string changeSign = changePct >= 0 ? "+" : "";
+            string shamsiTime = GetShamsiTehranTime(DateTime.UtcNow);
 
             try
             {
@@ -2783,26 +2952,35 @@ namespace StockBotApp
                 );
                 scatter.LineWidth = 3;
                 scatter.MarkerSize = 7;
-                plt.Title($"{symbol} Price History ($)");
-                plt.XLabel("Trades");
-                plt.YLabel("Price ($)");
-                plt.Axes.Left.Label.Text = "Price ($)";
+                plt.Title($"{symbol} / USD — {tfTitle} ({shamsiTime})");
+                plt.XLabel("معاملات ثبت‌شده (Trades)");
+                plt.YLabel("قیمت واحد دلاری ($)");
+                plt.Axes.Left.Label.Text = "قیمت ($)";
 
                 string filePath = $"{symbol}_chart_{DateTime.UtcNow.Ticks}.png";
                 await Task.Run(() => plt.SavePng(filePath, 800, 400), ct);
 
                 await using var stream = IOFile.OpenRead(filePath);
+                string caption = $"📊 نمودار قیمت **{symbol}** — *(بازه: {tfTitle})*\n" +
+                                 $"📅 تاریخ و زمان: **{shamsiTime}**\n\n" +
+                                 $"💵 قیمت لحظه‌ای بازار: **{FmtPrice(curPrice)}**\n" +
+                                 $"💎 قیمت پایه اولیه: {FmtPrice(baseValue)}\n" +
+                                 $"📈 تغییرات این بازه زمانی: **{changeSign}{changePct:N1}%** {changeIcon}\n\n" +
+                                 $"💡 برای تغییر بازه زمانی نمودار، روی دکمه‌های زیر کلیک کنید:";
+
                 await bot.SendPhoto(
                     chatId,
                     InputFile.FromStream(stream, filePath),
-                    caption: $"📈 چارت گرافیکی روند قیمت {symbol}\n💵 قیمت فعلی: {FmtPrice(curPrice)}\n💎 قیمت پایه: {FmtPrice(baseValue)}",
+                    caption: caption,
+                    parseMode: ParseMode.Markdown,
+                    replyMarkup: GetChartTimeframeKeyboard(symbol),
                     cancellationToken: ct
                 );
                 try { IOFile.Delete(filePath); } catch { }
             }
             catch
             {
-                await bot.SendMessage(chatId, $"📉 تاریخچه قیمت‌های {symbol} ($):\n" + string.Join(" → ", prices.Select(p => FmtPrice(p))), cancellationToken: ct);
+                await bot.SendMessage(chatId, $"📉 تاریخچه قیمت‌های {symbol} ($) — بازه: {tfTitle}\n" + string.Join(" → ", prices.Select(p => FmtPrice(p))), replyMarkup: GetChartTimeframeKeyboard(symbol), cancellationToken: ct);
             }
         }
 
@@ -2988,6 +3166,9 @@ namespace StockBotApp
 
                             currency.PriceHistory.Add(newTradePrice);
                             if (currency.PriceHistory.Count > 100) currency.PriceHistory.RemoveAt(0);
+
+                            currency.TimedPriceHistory.Add(new PricePoint { Timestamp = DateTime.UtcNow, Price = newTradePrice });
+                            if (currency.TimedPriceHistory.Count > 5000) currency.TimedPriceHistory.RemoveAt(0);
 
                             // به‌روزرسانی خودکار سفارشات خزانه با قیمت جدید بازار
                             AdjustTreasuryOrders(currency, newTradePrice);
