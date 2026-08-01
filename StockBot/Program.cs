@@ -838,15 +838,20 @@ namespace StockBotApp
             }
             else if (state == "REMOVE_CURRENCY")
             {
+                bool removed = false;
                 lock (_dataLock)
                 {
                     if (Market.ContainsKey(text.ToUpper()))
                     {
                         Market.Remove(text.ToUpper());
                         UserStates.Remove(chatId);
-                        await bot.SendMessage(chatId, "✅ ارز مورد نظر با موفقیت حذف شد.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
-                        return true;
+                        removed = true;
                     }
+                }
+                if (removed)
+                {
+                    await bot.SendMessage(chatId, "✅ ارز مورد نظر با موفقیت حذف شد.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                    return true;
                 }
             }
             else if (state == "SET_PRICE_SYMBOL")
@@ -864,15 +869,20 @@ namespace StockBotApp
                 var symbol = state.Split('_')[2];
                 if (decimal.TryParse(text, out var newPrice))
                 {
+                    bool updated = false;
                     lock (_dataLock)
                     {
                         if (Market.ContainsKey(symbol))
                         {
                             Market[symbol].PriceHistory.Add(newPrice);
                             UserStates.Remove(chatId);
-                            await bot.SendMessage(chatId, $"✅ قیمت ارز {symbol} به {FmtPrice(newPrice)} تغییر یافت.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
-                            return true;
+                            updated = true;
                         }
+                    }
+                    if (updated)
+                    {
+                        await bot.SendMessage(chatId, $"✅ قیمت ارز {symbol} به {FmtPrice(newPrice)} تغییر یافت.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        return true;
                     }
                 }
             }
@@ -895,15 +905,20 @@ namespace StockBotApp
                 else if (!string.IsNullOrWhiteSpace(text))
                     photoUrl = text;
 
+                bool photoSet = false;
                 lock (_dataLock)
                 {
                     if (Market.ContainsKey(symbol) && !string.IsNullOrWhiteSpace(photoUrl))
                     {
                         Market[symbol].PhotoUrl = photoUrl;
                         UserStates.Remove(chatId);
-                        await bot.SendMessage(chatId, $"✅ تصویر/آیکون ارز {symbol} با موفقیت تنظیم شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
-                        return true;
+                        photoSet = true;
                     }
+                }
+                if (photoSet)
+                {
+                    await bot.SendMessage(chatId, $"✅ تصویر/آیکون ارز {symbol} با موفقیت تنظیم شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                    return true;
                 }
             }
             else if (state == "SET_DESC_SYMBOL")
@@ -919,15 +934,20 @@ namespace StockBotApp
             else if (state.StartsWith("SET_DESC_TEXT_"))
             {
                 var symbol = state.Split('_')[3];
+                bool descSet = false;
                 lock (_dataLock)
                 {
                     if (Market.ContainsKey(symbol))
                     {
                         Market[symbol].Description = text;
                         UserStates.Remove(chatId);
-                        await bot.SendMessage(chatId, $"✅ توضیحات ارز {symbol} با موفقیت به‌روزرسانی شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
-                        return true;
+                        descSet = true;
                     }
+                }
+                if (descSet)
+                {
+                    await bot.SendMessage(chatId, $"✅ توضیحات ارز {symbol} با موفقیت به‌روزرسانی شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                    return true;
                 }
             }
             else if (state.StartsWith("CUSTOM_BUY_QTY_"))
