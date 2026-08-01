@@ -1,6 +1,6 @@
-// StockBot.cs - Telegram Stock Market Bot v2 (No Slash Commands + Complete Interactive UI)
+// StockBot.cs - Naomi (نائومی) Telegram Trading Bot (No Slash Commands + Complete Interactive UI)
 // تک‌فایل C# کامل - بدون هیچ دستوری که با / شروع شود
-// پشتیبانی کامل از دکمه‌های شیشه‌ای، چارت گرافیکی ScottPlot، نمایش دلار ($)، نقدینگی اولیه و مدیریت تصویر ارزها
+// پشتیبانی کامل از دکمه‌های شیشه‌ای، چارت گرافیکی ScottPlot، نمایش دلار ($) بدون اعشار اضافی، نقدینگی اولیه و سرعت فوق‌العاده بالا
 
 using System;
 using System.Collections.Generic;
@@ -23,6 +23,7 @@ namespace StockBotApp
         private static readonly string Token = "8871928516:AAGChm-ApCPvd53KZDD8pIr1CEfYISCcLqI";
         private static readonly long OwnerId = 8248899977;
         private static ITelegramBotClient Bot = null!;
+        public static string BotUsername = "NaomiBot";
 
         public class Currency
         {
@@ -72,8 +73,46 @@ namespace StockBotApp
         private static Dictionary<long, string> UserStates = new();
         private static readonly string DataFile = "stockbot_data.json";
 
-        public static string FmtMoney(decimal amount) => $"${amount:N2}";
-        public static string FmtPrice(decimal price) => $"${price:N2}";
+        private static readonly object _dataLock = new();
+        private static volatile bool _saveRequested = false;
+
+        public static string FmtMoney(decimal amount) => amount == Math.Floor(amount) ? $"${amount:N0}" : $"${amount:0.##}";
+        public static string FmtPrice(decimal price) => price == Math.Floor(price) ? $"${price:N0}" : $"${price:0.##}";
+
+        private static void RequestSave()
+        {
+            _saveRequested = true;
+        }
+
+        private static void SaveDataImmediate()
+        {
+            try
+            {
+                lock (_dataLock)
+                {
+                    var data = new { Market, Users };
+                    IOFile.WriteAllText(DataFile, JsonConvert.SerializeObject(data, Formatting.Indented));
+                }
+            }
+            catch { }
+        }
+
+        private static async Task BackgroundSaveWorker(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    if (_saveRequested)
+                    {
+                        _saveRequested = false;
+                        SaveDataImmediate();
+                    }
+                }
+                catch { }
+                await Task.Delay(300, ct);
+            }
+        }
 
         public static async Task Main(string[] args)
         {
@@ -84,28 +123,30 @@ namespace StockBotApp
             try { await Bot.DeleteWebhook(cancellationToken: CancellationToken.None); } catch { }
 
             var me = await Bot.GetMe();
-            Console.WriteLine($"Bot started successfully: @{me.Username}");
+            BotUsername = me.Username ?? "NaomiBot";
+            Console.WriteLine($"Naomi Bot started successfully: @{BotUsername}");
 
             var cts = new CancellationTokenSource();
             AppDomain.CurrentDomain.ProcessExit += (s, e) => {
-                SaveData();
+                SaveDataImmediate();
                 cts.Cancel();
             };
             Console.CancelKeyPress += (s, e) => {
                 e.Cancel = true;
-                SaveData();
+                SaveDataImmediate();
                 cts.Cancel();
             };
 
+            _ = Task.Run(() => BackgroundSaveWorker(cts.Token), cts.Token);
             _ = Task.Run(DailyRewardScheduler, cts.Token);
             _ = Task.Run(DatabaseBackupScheduler, cts.Token);
 
             var receiverOptions = new ReceiverOptions { AllowedUpdates = Array.Empty<UpdateType>() };
             Bot.StartReceiving(HandleUpdateAsync, HandleErrorAsync, receiverOptions, cts.Token);
 
-            Console.WriteLine("Bot is running in background/daemon mode. Press Ctrl+C to stop...");
+            Console.WriteLine("Naomi is running in background/daemon mode. Press Ctrl+C to stop...");
             try { await Task.Delay(-1, cts.Token); } catch { }
-            SaveData();
+            SaveDataImmediate();
         }
 
         private static void LoadData()
@@ -136,7 +177,7 @@ namespace StockBotApp
             if (Market == null) Market = new();
             if (Users == null) Users = new();
 
-            // پاک‌سازی دیتابیس قدیمی از مقادیر null
+            // پاک‌سازی دیتابیس از مقادیر null
             foreach (var c in Market.Values)
             {
                 if (c.Orders == null) c.Orders = new();
@@ -157,16 +198,6 @@ namespace StockBotApp
 
             EnsureTreasuryAccount();
             EnsureDefaultCurrencies();
-        }
-
-        private static void SaveData()
-        {
-            try
-            {
-                var data = new { Market, Users };
-                IOFile.WriteAllText(DataFile, JsonConvert.SerializeObject(data, Formatting.Indented));
-            }
-            catch { }
         }
 
         private static void EnsureTreasuryAccount()
@@ -275,7 +306,7 @@ namespace StockBotApp
                 if (update.CallbackQuery is { } callbackQuery)
                 {
                     await HandleCallbackQueryAsync(bot, callbackQuery, ct);
-                    SaveData();
+                    RequestSave();
                     return;
                 }
 
@@ -308,7 +339,7 @@ namespace StockBotApp
                 {
                     if (await HandleStateAsync(bot, message, state, ct))
                     {
-                        SaveData();
+                        RequestSave();
                         return;
                     }
                 }
@@ -318,7 +349,7 @@ namespace StockBotApp
                 else
                     await HandleUserCommands(bot, message, text, ct);
 
-                SaveData();
+                RequestSave();
             }
             catch (Exception ex)
             {
@@ -522,7 +553,7 @@ namespace StockBotApp
             {
                 await bot.SendMessage(
                     chatId,
-                    "👑 به پنل مدیریت پیشرفته StockBot v2 خوش آمدید!",
+                    "👑 به پنل مدیریت پیشرفته نائومی (Naomi) خوش آمدید!",
                     replyMarkup: GetOwnerKeyboard(),
                     cancellationToken: ct
                 );
@@ -742,12 +773,12 @@ namespace StockBotApp
                         referrer.Balance += 500m;
                         referrer.Referrals++;
                         user.Balance += 200m;
-                        try { await bot.SendMessage(referrer.UserId, $"🎉 تبریک! یک کاربر جدید با کد دعوت شما عضو شد! +$500.00 پاداش به موجودی شما اضافه شد."); } catch { }
+                        try { await bot.SendMessage(referrer.UserId, $"🎉 تبریک! یک کاربر جدید با کد دعوت شما عضو شد! +$500 پاداش به موجودی شما اضافه شد."); } catch { }
                     }
                 }
 
-                string welcome = $"🌟 به شبیه‌ساز حرفه‌ای بازار سهام (StockBot v2) خوش آمدید!\n\n" +
-                                 $"💰 موجودی دلار نقدی شما: {FmtMoney(user.Balance)}\n" +
+                string welcome = $"🌟 به بات معاملاتی نائومی (Naomi) خوش آمدید!\n\n" +
+                                 $"💰 موجودی نقدی شما: {FmtMoney(user.Balance)}\n" +
                                  $"📈 سطح کاربری: Level {user.Level} ({user.XP}/{user.Level * 100} XP)\n" +
                                  $"🎁 کد دعوت اختصاصی شما: {user.ReferralCode}\n\n" +
                                  $"از دکمه‌های منوی زیر یا دکمه‌های شیشه‌ای برای مشاهده بازار، معامله سریع و دریافت نمودار گرافیکی استفاده کنید:";
@@ -798,11 +829,11 @@ namespace StockBotApp
                 return;
             }
 
-            // پورتفولیو
-            if (text == "پورتفولیو" || text == "💼 پورتفولیو من")
+            // پرتفو
+            if (text == "پرتفو" || text == "پورتفولیو" || text == "💼 پرتفو من" || text == "💼 پورتفولیو من")
             {
                 decimal totalStockVal = 0m;
-                string p = $"💼 سبد دارایی و پورتفولیو شما (@{user.Username}):\n\n" +
+                string p = $"💼 سبد دارایی و پرتفو شما (@{user.Username}):\n\n" +
                            $"💵 موجودی نقدی دلار: {FmtMoney(user.Balance)}\n\n" +
                            $"📦 سهام‌های خریداری‌شده:\n";
 
@@ -818,7 +849,7 @@ namespace StockBotApp
 
                 if (!hasStock)
                 {
-                    p += "🔹 شما در حال حاضر هیچ سهامی در پورتفولیو ندارید.\n";
+                    p += "🔹 شما در حال حاضر هیچ سهامی در پرتفو ندارید.\n";
                 }
 
                 p += $"\n💎 مجموع ارزش سهام‌ها: {FmtMoney(totalStockVal)}\n" +
@@ -852,7 +883,7 @@ namespace StockBotApp
             {
                 string refMsg = $"🎁 کد دعوت اختصاصی شما: {user.ReferralCode}\n\n" +
                                 $"🔗 لینک دعوت مستقیم:\n" +
-                                $"https://t.me/{(await bot.GetMe()).Username}?start={user.ReferralCode}\n\n" +
+                                $"https://t.me/{BotUsername}?start={user.ReferralCode}\n\n" +
                                 $"با دعوت هر دوست با لینک یا کد بالا، شما مبلغ {FmtMoney(500m)} و دوست شما مبلغ {FmtMoney(200m)} پاداش اولیه دریافت می‌کند!\n" +
                                 $"👥 تعداد دوستان دعوت‌شده: {user.Referrals} نفر";
 
@@ -1090,7 +1121,7 @@ namespace StockBotApp
                     var order = new Order { UserId = userId, Type = "BUY", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
                     c.Orders.Add(order);
                     MatchOrders(symbol, userId);
-                    SaveData();
+                    RequestSave();
 
                     await bot.SendMessage(
                         chatId,
@@ -1117,7 +1148,7 @@ namespace StockBotApp
                     var order = new Order { UserId = userId, Type = "SELL", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
                     c.Orders.Add(order);
                     MatchOrders(symbol, userId);
-                    SaveData();
+                    RequestSave();
 
                     await bot.SendMessage(
                         chatId,
@@ -1143,7 +1174,7 @@ namespace StockBotApp
                     var order = new Order { UserId = userId, Type = "SELL", Price = price, Quantity = hasStock, Timestamp = DateTime.UtcNow };
                     c.Orders.Add(order);
                     MatchOrders(symbol, userId);
-                    SaveData();
+                    RequestSave();
 
                     await bot.SendMessage(
                         chatId,
@@ -1157,7 +1188,7 @@ namespace StockBotApp
             {
                 string refMsg = $"🎁 کد دعوت اختصاصی شما: {user.ReferralCode}\n\n" +
                                 $"🔗 لینک دعوت مستقیم:\n" +
-                                $"https://t.me/{(await bot.GetMe()).Username}?start={user.ReferralCode}\n\n" +
+                                $"https://t.me/{BotUsername}?start={user.ReferralCode}\n\n" +
                                 $"با دعوت هر دوست، شما مبلغ {FmtMoney(500m)} و دوست شما مبلغ {FmtMoney(200m)} پاداش اولیه دریافت می‌کند!\n" +
                                 $"👥 دوستان دعوت‌شده: {user.Referrals} نفر";
                 await bot.SendMessage(chatId, refMsg, cancellationToken: ct);
@@ -1399,7 +1430,7 @@ namespace StockBotApp
         {
             var rows = new List<KeyboardButton[]>
             {
-                new KeyboardButton[] { "📊 بازار و قیمت‌ها", "💼 پورتفولیو من", "💰 موجودی من" },
+                new KeyboardButton[] { "📊 بازار و قیمت‌ها", "💼 پرتفو من", "💰 موجودی من" },
                 new KeyboardButton[] { "🛒 خرید سهام", "💰 فروش سهام", "📈 نمودار و چارت" },
                 new KeyboardButton[] { "🏆 لیدربورد برترین‌ها", "🎁 دعوت دوستان", "📖 راهنمای بات" }
             };
@@ -1426,19 +1457,19 @@ namespace StockBotApp
 
         private static string GetCompleteHelpText()
         {
-            return @"📖 راهنمای کامل بات شبیه‌ساز بازار سهام (StockBot v2)
+            return @"📖 راهنمای استفاده از بات معاملاتی نائومی (Naomi)
 
-🌟 به دنیای جذاب شبیه‌ساز معاملات سهام خوش آمدید! تمام حساب‌ها، موجودی‌ها و معاملات بر حسب دلار ($) محاسبه می‌شوند.
+🌟 به بات نائومی خوش آمدید! تمامی معاملات، قیمت‌ها و موجودی‌ها بر حسب دلار ($) محاسبه می‌شود.
 
 ---
 🔘 دکمه‌های منوی پایین صفحه:
 • 📊 بازار و قیمت‌ها: مشاهده لیست قیمت‌های لحظه‌ای بازار و ورود به صفحه اختصاصی هر ارز همراه با عکس و امکان خرید/فروش فوری
-• 💼 پورتفولیو من: مشاهده سبد دارایی‌ها و ارزش کل حساب ($)
+• 💼 پرتفو من: مشاهده سبد دارایی‌ها و ارزش کل حساب ($)
 • 💰 موجودی من: مشاهده موجودی نقدی دلار ($) و سطح کاربری (Level / XP)
 • 🛒 خرید سهام و 💰 فروش سهام: منوی سریع خرید و فروش هر ارز
 • 📈 نمودار و چارت: دریافت نمودار گرافیکی روند قیمت ارزها (ScottPlot)
 • 🏆 لیدربورد برترین‌ها: مشاهده ۱۰ معامله‌گر برتر با بیشترین ارزش دارایی
-• 🎁 دعوت دوستان: دریافت لینک دعوت و پاداش $500.00 برای هر دعوت
+• 🎁 دعوت دوستان: دریافت لینک دعوت و پاداش $500 برای هر دعوت
 
 ---
 ⌨️ دستورات متنی سریع (بدون اسلش):
@@ -1447,13 +1478,13 @@ namespace StockBotApp
 • فروش BTC 5 65000 — فروش ۵ واحد بیت‌کوین به قیمت واحد ۶۵۰۰۰ دلار
 • چارت BTC — دریافت نمودار گرافیکی بیت‌کوین
 • پنل ارز BTC — مشاهده اطلاعات کامل، تصویر و سفارشات باز
-• پورتفولیو — مشاهده دارایی‌ها
+• پرتفو — مشاهده دارایی‌ها
 • موجودی — مشاهده موجودی دلار
 
 ---
-💡 نکات طلایی:
+💡 نکات مهم:
 ۱. 🏦 نقدینگی اولیه و قیمت پایه تمام ارزها توسط خزانه مرکزی در اوردربوک تأمین شده است؛ شما در هر لحظه می‌توانید با یک کلیک خرید و فروش کنید!
-۲. 🌙 پاداش شبانه: هر شب ساعت ۱۲ (به وقت تهران)، اگر موجودی نقدی شما کمتر از $5,000.00 باشد، مبلغ $1,000.00 هدیه به حسابتان واریز می‌شود!";
+۲. 🌙 پاداش شبانه: هر شب ساعت ۱۲ (به وقت تهران)، اگر موجودی نقدی شما کمتر از $5,000 باشد، مبلغ $1,000 هدیه به حسابتان واریز می‌شود!";
         }
 
         // ===================== MATCHING ENGINE =====================
@@ -1561,7 +1592,7 @@ namespace StockBotApp
                                 catch { }
                             }
                         }
-                        SaveData();
+                        RequestSave();
                     }
                 }
                 catch { }
