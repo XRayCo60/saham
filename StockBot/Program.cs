@@ -150,28 +150,73 @@ namespace StockBotApp
 
         private static void SaveDataImmediate()
         {
+            List<Currency> currenciesCopy;
+            List<User> usersCopy;
+
+            lock (_dataLock)
+            {
+                currenciesCopy = Market.Values.Select(c => new Currency
+                {
+                    Symbol = c.Symbol,
+                    Description = c.Description,
+                    BaseValue = c.BaseValue,
+                    TotalSupply = c.TotalSupply,
+                    CirculatingSupply = c.CirculatingSupply,
+                    PhotoUrl = c.PhotoUrl,
+                    PriceHistory = new List<decimal>(c.PriceHistory),
+                    Orders = c.Orders.Select(o => new Order
+                    {
+                        UserId = o.UserId,
+                        Type = o.Type,
+                        Price = o.Price,
+                        Quantity = o.Quantity,
+                        Timestamp = o.Timestamp
+                    }).ToList()
+                }).ToList();
+
+                usersCopy = Users.Values.Select(u => new User
+                {
+                    UserId = u.UserId,
+                    Username = u.Username,
+                    Balance = u.Balance,
+                    Portfolio = new Dictionary<string, long>(u.Portfolio),
+                    DeviceFingerprints = new List<long>(u.DeviceFingerprints),
+                    LastDailyReward = u.LastDailyReward,
+                    Level = u.Level,
+                    XP = u.XP,
+                    TotalTrades = u.TotalTrades,
+                    SuccessfulTrades = u.SuccessfulTrades,
+                    TotalProfit = u.TotalProfit,
+                    CrisisSurvived = u.CrisisSurvived,
+                    ReferralCode = u.ReferralCode,
+                    Referrals = u.Referrals
+                }).ToList();
+            }
+
+            // اکنون قفل حافظه (_dataLock) کاملاً آزاد است و ربات با سرعت ۰ میلی‌ثانیه به تلگرام پاسخ می‌دهد!
+            if (_useSqlite)
+            {
+                try
+                {
+                    SaveToSqliteSnapshot(currenciesCopy, usersCopy);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[Naomi] SQLite save error, switching to JSON fallback: {ex.Message}");
+                    _useSqlite = false;
+                }
+            }
+
             try
             {
-                lock (_dataLock)
+                var data = new
                 {
-                    if (_useSqlite)
-                    {
-                        try
-                        {
-                            SaveToSqliteImmediate();
-                            return;
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"[Naomi] SQLite save error, switching to JSON fallback: {ex.Message}");
-                            _useSqlite = false;
-                        }
-                    }
-
-                    // ذخیره در مسیر پشتیبان JSON (/root/naomi_data.json)
-                    var data = new { Market, Users, IsInitialized = true };
-                    IOFile.WriteAllText(JsonPath, JsonConvert.SerializeObject(data, Formatting.Indented));
-                }
+                    Market = currenciesCopy.ToDictionary(c => c.Symbol, c => c),
+                    Users = usersCopy.ToDictionary(u => u.UserId, u => u),
+                    IsInitialized = true
+                };
+                IOFile.WriteAllText(JsonPath, JsonConvert.SerializeObject(data, Formatting.Indented));
             }
             catch (Exception ex)
             {
@@ -179,7 +224,7 @@ namespace StockBotApp
             }
         }
 
-        private static void SaveToSqliteImmediate()
+        private static void SaveToSqliteSnapshot(List<Currency> currenciesCopy, List<User> usersCopy)
         {
             using var conn = GetDbConnection();
             using var trans = conn.BeginTransaction();
@@ -191,7 +236,7 @@ namespace StockBotApp
                 delCmd.ExecuteNonQuery();
             }
 
-            foreach (var c in Market.Values)
+            foreach (var c in currenciesCopy)
             {
                 using var insCmd = conn.CreateCommand();
                 insCmd.Transaction = trans;
@@ -215,7 +260,7 @@ namespace StockBotApp
                 delCmd.ExecuteNonQuery();
             }
 
-            foreach (var c in Market.Values)
+            foreach (var c in currenciesCopy)
             {
                 foreach (var o in c.Orders)
                 {
@@ -241,7 +286,7 @@ namespace StockBotApp
                 delCmd.ExecuteNonQuery();
             }
 
-            foreach (var u in Users.Values)
+            foreach (var u in usersCopy)
             {
                 using var insCmd = conn.CreateCommand();
                 insCmd.Transaction = trans;
