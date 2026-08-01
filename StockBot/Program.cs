@@ -2953,8 +2953,8 @@ namespace StockBotApp
                             buy.Quantity -= matchQty;
                             sell.Quantity -= matchQty;
 
-                            // محاسبه قیمت پویا بر اساس عرضه و تقاضا (Dynamic AMM Price Impact)
-                            decimal impactPct = Math.Max(0.0004m * matchQty, (decimal)matchQty / Math.Max(1000m, (decimal)currency.CirculatingSupply) * 0.12m);
+                            // محاسبه قیمت پویا بر اساس عرضه و تقاضا با دامنه نوسان (Dynamic AMM Price Impact + Circuit Breaker)
+                            decimal impactPct = Math.Min(0.15m, Math.Max(0.0004m * matchQty, (decimal)matchQty / Math.Max(1000m, (decimal)currency.CirculatingSupply) * 0.12m));
                             decimal newTradePrice = tradePrice;
                             if (buy.UserId != 0 && sell.UserId == 0) // تقاضای خرید از خزانه -> ۱۰۰٪ افزایش قیمت
                             {
@@ -2964,7 +2964,7 @@ namespace StockBotApp
                             {
                                 newTradePrice = Math.Max(0.01m, tradePrice * (1m - (impactPct * 0.75m)));
                             }
-                            else // معامله P2P بین دو کاربر واقعی
+                            else // معامله P2P بین دو کاربر واقعی (ثبت قیمت توافقی به عنوان قیمت لحظه‌ای بازار)
                             {
                                 newTradePrice = tradePrice;
                             }
