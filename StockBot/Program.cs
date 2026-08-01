@@ -343,18 +343,18 @@ namespace StockBotApp
 
             LoadData();
 
-            // تنظیم SocketsHttpHandler با پینّگ‌های مداوم TCP Keep-Alive جهت جلوگیری از فریز شدن یا دراپ شدن کانکشن در سرورهای لینوکس
+            // تنظیم SocketsHttpHandler پایدار با پینّگ‌های مداوم TCP Keep-Alive جهت جلوگیری از قطع شدن کانکشن در سرورهای لینوکس
             var handler = new SocketsHttpHandler
             {
-                PooledConnectionLifetime = TimeSpan.FromMinutes(2),
-                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(1),
-                KeepAlivePingDelay = TimeSpan.FromSeconds(15),
-                KeepAlivePingTimeout = TimeSpan.FromSeconds(5),
+                PooledConnectionLifetime = TimeSpan.FromMinutes(15),
+                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
+                KeepAlivePingDelay = TimeSpan.FromSeconds(20),
+                KeepAlivePingTimeout = TimeSpan.FromSeconds(10),
                 EnableMultipleHttp2Connections = true
             };
             var httpClient = new HttpClient(handler)
             {
-                Timeout = TimeSpan.FromSeconds(45)
+                Timeout = TimeSpan.FromSeconds(120) // تایم‌اوت ۱۲۰ ثانیه برای جلوگیری از لغو درخواست‌های Long Polling تلگرام
             };
 
             Bot = new TelegramBotClient(Token, httpClient);
@@ -2194,48 +2194,79 @@ namespace StockBotApp
                 return;
             }
 
-            string msg = $"📋 **تابلوی معاملاتی لایو (بورس همتا به همتا) — {cCopy.Symbol}**\n\n" +
-                         $"💵 آخرین قیمت معامله: **{FmtPrice(curPrice)}**\n" +
+            string msg = $"🏛 تابلوی معاملاتی لایو (بورس همتا به همتا)\n" +
+                         $"━━━ {cCopy.Symbol} — {cCopy.Description} ━━━\n\n" +
+                         $"💵 آخرین قیمت معامله: {FmtPrice(curPrice)}\n" +
                          $"💎 قیمت پایه (عرضه اولیه): {FmtPrice(cCopy.BaseValue)}\n" +
-                         $"🏦 سهام باقی‌مانده عرضه اولیه خزانه: **{ipoLeft:N0}** واحد\n\n" +
-                         $"═════════════════════════\n" +
-                         $"🟢 **صف خرید (Bids — تقاضا):**\n" +
-                         $"حجم | قیمت واحد | خریدار\n" +
-                         $"-------------------------\n";
+                         $"🏦 سهام باقی‌مانده عرضه اولیه خزانه: {ipoLeft:N0} واحد\n\n" +
+                         $"━━━━━━━━━━━━━━━━━━━━━━\n" +
+                         $"🟢 صف خرید (Bids — تقاضا):\n" +
+                         $"┌ حجم ───── قیمت ───── خریدار\n";
 
             if (buyOrders.Count == 0)
             {
-                msg += "*(صف خرید خالی است)*\n";
+                msg += "└ (صف خرید خالی است)\n";
             }
             else
             {
-                foreach (var o in buyOrders)
+                var groupedBuys = buyOrders
+                    .GroupBy(o => o.Price)
+                    .Select(g => new
+                    {
+                        Price = g.Key,
+                        TotalQty = g.Sum(o => o.Quantity),
+                        Count = g.Count(),
+                        FirstUser = g.First().UserId
+                    })
+                    .OrderByDescending(x => x.Price)
+                    .Take(5)
+                    .ToList();
+
+                for (int i = 0; i < groupedBuys.Count; i++)
                 {
-                    string uName = (Users.TryGetValue(o.UserId, out var u) ? $"@{u.Username}" : $"{o.UserId}");
-                    msg += $"**{o.Quantity:N0}** واحد | **{FmtPrice(o.Price)}** | {uName}\n";
+                    var item = groupedBuys[i];
+                    string prefix = (i == groupedBuys.Count - 1) ? "└" : "├";
+                    string uName = (Users.TryGetValue(item.FirstUser, out var u) ? $"@{u.Username}" : $"{item.FirstUser}");
+                    if (item.Count > 1) uName += $" ({item.Count} سفارش)";
+                    msg += $"{prefix} {item.TotalQty:N0} واحد ─── {FmtPrice(item.Price)} ─── {uName}\n";
                 }
             }
 
-            msg += $"═════════════════════════\n" +
-                   $"🔴 **صف فروش (Asks — عرضه):**\n" +
-                   $"حجم | قیمت واحد | فروشنده\n" +
-                   $"-------------------------\n";
+            msg += $"━━━━━━━━━━━━━━━━━━━━━━\n" +
+                   $"🔴 صف فروش (Asks — عرضه):\n" +
+                   $"┌ حجم ───── قیمت ───── فروشنده\n";
 
             if (sellOrders.Count == 0)
             {
-                msg += "*(صف فروش خالی است)*\n";
+                msg += "└ (صف فروش خالی است)\n";
             }
             else
             {
-                foreach (var o in sellOrders)
+                var groupedSells = sellOrders
+                    .GroupBy(o => o.Price)
+                    .Select(g => new
+                    {
+                        Price = g.Key,
+                        TotalQty = g.Sum(o => o.Quantity),
+                        Count = g.Count(),
+                        FirstUser = g.First().UserId
+                    })
+                    .OrderBy(x => x.Price)
+                    .Take(5)
+                    .ToList();
+
+                for (int i = 0; i < groupedSells.Count; i++)
                 {
-                    string uName = o.UserId == 0 ? "🏦 خزانه (عرضه اولیه)" : (Users.TryGetValue(o.UserId, out var u) ? $"@{u.Username}" : $"{o.UserId}");
-                    msg += $"**{o.Quantity:N0}** واحد | **{FmtPrice(o.Price)}** | {uName}\n";
+                    var item = groupedSells[i];
+                    string prefix = (i == groupedSells.Count - 1) ? "└" : "├";
+                    string uName = item.FirstUser == 0 ? "🏦 خزانه (عرضه اولیه)" : (Users.TryGetValue(item.FirstUser, out var u) ? $"@{u.Username}" : $"{item.FirstUser}");
+                    if (item.Count > 1 && item.FirstUser != 0) uName += $" ({item.Count} سفارش)";
+                    msg += $"{prefix} {item.TotalQty:N0} واحد ─── {FmtPrice(item.Price)} ─── {uName}\n";
                 }
             }
 
-            msg += $"═════════════════════════\n" +
-                   $"💡 *در بازار P2P، سفارش شما با کمترین قیمت فروشنده یا بیشترین قیمت خریدار معامله می‌شود؛ مگر اینکه در قیمت دلخواه سفارش بگذارید.*";
+            msg += $"━━━━━━━━━━━━━━━━━━━━━━\n" +
+                   $"💡 در بازار P2P، سفارش شما با کمترین قیمت فروشنده یا بیشترین قیمت خریدار معامله می‌شود؛ مگر اینکه در قیمت دلخواه سفارش بگذارید.";
 
             var kb = new InlineKeyboardMarkup(new[]
             {
@@ -2260,7 +2291,7 @@ namespace StockBotApp
                 }
             });
 
-            await bot.SendMessage(chatId, msg, parseMode: ParseMode.Markdown, replyMarkup: kb, cancellationToken: ct);
+            await bot.SendMessage(chatId, msg, replyMarkup: kb, cancellationToken: ct);
         }
 
         private static async Task SendUserOpenOrdersAsync(ITelegramBotClient bot, long chatId, long userId, string symbol, CancellationToken ct)
@@ -2280,20 +2311,20 @@ namespace StockBotApp
                 return;
             }
 
-            string msg = $"📋 **سفارش‌های باز شما در تابلوی معاملاتی {symbol}:**\n\n" +
+            string msg = $"📋 سفارش‌های باز شما در تابلوی معاملاتی {symbol}:\n\n" +
                          $"برای لغو هر سفارش و بازگشت وجه/سهام مسدودشده، روی دکمه لغو مربوطه کلیک کنید:\n";
 
             var rows = new List<InlineKeyboardButton[]>();
             foreach (var o in userOrders)
             {
                 string typeName = o.Type == "BUY" ? "خرید 🛒" : "فروش 💰";
-                msg += $"• [{typeName}] **{o.Quantity:N0}** واحد به قیمت **{FmtPrice(o.Price)}**\n";
+                msg += $"• [{typeName}] {o.Quantity:N0} واحد به قیمت {FmtPrice(o.Price)}\n";
                 rows.Add(new[] { InlineKeyboardButton.WithCallbackData($"❌ لغو سفارش {typeName} ({o.Quantity} واحد @ {FmtPrice(o.Price)})", $"CANCEL_ORDER_{symbol}_{o.Timestamp.Ticks}") });
             }
 
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🔙 بازگشت به تابلو", $"BOARD_{symbol}") });
 
-            await bot.SendMessage(chatId, msg, parseMode: ParseMode.Markdown, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
+            await bot.SendMessage(chatId, msg, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
         }
 
         private static async Task SendSymbolCardAsync(ITelegramBotClient bot, long chatId, string symbol, CancellationToken ct)
