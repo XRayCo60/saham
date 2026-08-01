@@ -674,45 +674,26 @@ namespace StockBotApp
             decimal curPrice = GetCurrentPrice(symbol);
             if (curPrice <= 0) curPrice = currency.BaseValue > 0 ? currency.BaseValue : 1m;
 
-            // ایجاد یا همگام‌سازی اجباری قیمت سفارش فروش خزانه با قیمت لحظه‌ای بازار
+            // حذف سفارشات خرید خزانه؛ فروش سهام توسط کاربران همیشه ۱۰۰٪ همتا به همتا (P2P) است
+            currency.Orders.RemoveAll(o => o.Type == "BUY" && o.UserId == 0);
+
+            // ایجاد سفارش فروش اولیه خزانه در قیمت پایه تنها تا زمانی که سهام اولیه دست مردم نیفتاده است
             var treasurySell = currency.Orders.FirstOrDefault(o => o.Type == "SELL" && o.UserId == 0 && o.Quantity > 0);
-            if (treasurySell == null)
+            if (treasurySell == null && currency.CirculatingSupply > 0)
             {
-                long ipoQty = currency.CirculatingSupply;
-                if (ipoQty <= 0) ipoQty = Math.Max(1000, currency.TotalSupply / 10);
                 currency.Orders.Add(new Order
                 {
                     UserId = 0,
                     Type = "SELL",
                     Price = curPrice,
-                    Quantity = ipoQty,
+                    Quantity = currency.CirculatingSupply,
                     Timestamp = DateTime.UtcNow
                 });
             }
-            else
+            else if (treasurySell != null)
             {
                 treasurySell.Price = curPrice;
-            }
-
-            // ایجاد یا همگام‌سازی اجباری قیمت سفارش خرید خزانه (۵٪ زیر قیمت جاری بازار)
-            decimal buyPrice = Math.Max(0.01m, curPrice * 0.95m);
-            var treasuryBuy = currency.Orders.FirstOrDefault(o => o.Type == "BUY" && o.UserId == 0 && o.Quantity > 0);
-            if (treasuryBuy == null)
-            {
-                long buyQty = currency.CirculatingSupply;
-                if (buyQty <= 0) buyQty = Math.Max(1000, currency.TotalSupply / 10);
-                currency.Orders.Add(new Order
-                {
-                    UserId = 0,
-                    Type = "BUY",
-                    Price = buyPrice,
-                    Quantity = buyQty,
-                    Timestamp = DateTime.UtcNow
-                });
-            }
-            else
-            {
-                treasuryBuy.Price = buyPrice;
+                currency.CirculatingSupply = treasurySell.Quantity; // به‌روزرسانی سهام باقی‌مانده عرضه اولیه
             }
 
             if (!Users[0].Portfolio.ContainsKey(symbol) || Users[0].Portfolio[symbol] < currency.CirculatingSupply)
@@ -1121,6 +1102,131 @@ namespace StockBotApp
                     return true;
                 }
             }
+            else if (state.StartsWith("LIMIT_BUY_QTY_"))
+            {
+                var symbol = state.Split('_')[3];
+                if (long.TryParse(text, out var qty) && qty > 0)
+                {
+                    UserStates[chatId] = $"LIMIT_BUY_PRICE_{symbol}_{qty}";
+                    await bot.SendMessage(chatId, $"💵 اکنون قیمت واحد دلخواه خود به دلار ($) را برای ورود به صف خرید {symbol} وارد کنید (مثال: 64500):", cancellationToken: ct);
+                    return true;
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, "❌ لطفاً یک عدد معتبر بزرگتر از ۰ وارد کنید (یا تایپ کنید لغو):", cancellationToken: ct);
+                    return true;
+                }
+            }
+            else if (state.StartsWith("LIMIT_BUY_PRICE_"))
+            {
+                var parts = state.Split('_');
+                var symbol = parts[3];
+                var qty = long.Parse(parts[4]);
+                if (decimal.TryParse(text, out var price) && price > 0)
+                {
+                    bool placed = false;
+                    decimal totalCost = price * qty * 1.01m;
+                    lock (_dataLock)
+                    {
+                        if (Market.TryGetValue(symbol, out var c))
+                        {
+                            var user = Users[message.From!.Id];
+                            if (user.Balance >= totalCost)
+                            {
+                                user.Balance -= totalCost; // مسدودسازی موقت وجه برای صف خرید
+                                c.Orders.Add(new Order { UserId = user.UserId, Type = "BUY", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow });
+                                MatchOrders(symbol, user.UserId);
+                                placed = true;
+                            }
+                        }
+                    }
+                    if (placed)
+                    {
+                        RequestSave();
+                        var u = Users[message.From!.Id];
+                        await bot.SendMessage(
+                            chatId,
+                            $"✅ سفارش خرید {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} در تابلوی معاملاتی (صف خرید) ثبت شد!\nدر صورت حضور فروشنده معامله فوری انجام شده یا در صف باقی می‌ماند.",
+                            replyMarkup: u.UserId == OwnerId ? GetOwnerKeyboard() : GetUserKeyboard(u.UserId),
+                            cancellationToken: ct
+                        );
+                    }
+                    else
+                    {
+                        await bot.SendMessage(chatId, $"❌ موجودی نقدی دلار شما برای این سفارش کافی نیست.\nمبلغ مورد نیاز: {FmtMoney(totalCost)}", cancellationToken: ct);
+                    }
+                    UserStates.Remove(chatId);
+                    return true;
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, "❌ لطفاً یک قیمت معتبر بزرگتر از ۰ وارد کنید:", cancellationToken: ct);
+                    return true;
+                }
+            }
+            else if (state.StartsWith("LIMIT_SELL_QTY_"))
+            {
+                var symbol = state.Split('_')[3];
+                if (long.TryParse(text, out var qty) && qty > 0)
+                {
+                    UserStates[chatId] = $"LIMIT_SELL_PRICE_{symbol}_{qty}";
+                    await bot.SendMessage(chatId, $"💵 اکنون قیمت واحد دلخواه خود به دلار ($) را برای ورود به صف فروش {symbol} وارد کنید (مثال: 65500):", cancellationToken: ct);
+                    return true;
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, "❌ لطفاً یک عدد معتبر بزرگتر از ۰ وارد کنید (یا تایپ کنید لغو):", cancellationToken: ct);
+                    return true;
+                }
+            }
+            else if (state.StartsWith("LIMIT_SELL_PRICE_"))
+            {
+                var parts = state.Split('_');
+                var symbol = parts[3];
+                var qty = long.Parse(parts[4]);
+                if (decimal.TryParse(text, out var price) && price > 0)
+                {
+                    bool placed = false;
+                    long hasStock = 0;
+                    lock (_dataLock)
+                    {
+                        if (Market.TryGetValue(symbol, out var c))
+                        {
+                            var user = Users[message.From!.Id];
+                            hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                            if (hasStock >= qty)
+                            {
+                                user.Portfolio[symbol] -= qty; // مسدودسازی موقت سهام برای صف فروش
+                                c.Orders.Add(new Order { UserId = user.UserId, Type = "SELL", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow });
+                                MatchOrders(symbol, user.UserId);
+                                placed = true;
+                            }
+                        }
+                    }
+                    if (placed)
+                    {
+                        RequestSave();
+                        var u = Users[message.From!.Id];
+                        await bot.SendMessage(
+                            chatId,
+                            $"✅ سفارش فروش {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} در تابلوی معاملاتی (صف فروش) ثبت شد!\nدر صورت حضور خریدار معامله فوری انجام شده یا در صف باقی می‌ماند.",
+                            replyMarkup: u.UserId == OwnerId ? GetOwnerKeyboard() : GetUserKeyboard(u.UserId),
+                            cancellationToken: ct
+                        );
+                    }
+                    else
+                    {
+                        await bot.SendMessage(chatId, $"❌ موجودی سهام {symbol} شما کافی نیست. موجودی: {hasStock:N0} واحد", cancellationToken: ct);
+                    }
+                    UserStates.Remove(chatId);
+                    return true;
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, "❌ لطفاً یک قیمت معتبر بزرگتر از ۰ وارد کنید:", cancellationToken: ct);
+                    return true;
+                }
+            }
 
             return false;
         }
@@ -1431,6 +1537,13 @@ namespace StockBotApp
                 return;
             }
 
+            // تابلوی معاملاتی لایو (بورس P2P)
+            if (text == "تابلو" || text == "تابلوی معاملاتی" || text == "📋 تابلوی معاملاتی")
+            {
+                await SendBoardSelectorAsync(bot, chatId, ct);
+                return;
+            }
+
             // خرید سهام
             if (text == "خرید سهام" || text == "🛒 خرید سهام")
             {
@@ -1554,6 +1667,16 @@ namespace StockBotApp
                 {
                     var symbol = parts[1].ToUpper();
                     await SendGraphicChartAsync(bot, chatId, symbol, ct);
+                    return;
+                }
+            }
+            else if (text.StartsWith("تابلو ") || text.StartsWith("تابلوی معاملاتی "))
+            {
+                var parts = text.Split(' ');
+                if (parts.Length >= 2)
+                {
+                    var symbol = parts.Last().ToUpper();
+                    await SendTradingBoardAsync(bot, chatId, symbol, ct);
                     return;
                 }
             }
@@ -1720,10 +1843,73 @@ namespace StockBotApp
                 var symbol = data.Split('_')[2];
                 await SendSymbolCardAsync(bot, chatId, symbol, ct);
             }
+            else if (data.StartsWith("BOARD_"))
+            {
+                var symbol = data.Split('_')[1];
+                await SendTradingBoardAsync(bot, chatId, symbol, ct);
+            }
+            else if (data.StartsWith("MY_ORDERS_"))
+            {
+                var symbol = data.Split('_')[2];
+                await SendUserOpenOrdersAsync(bot, chatId, userId, symbol, ct);
+            }
+            else if (data.StartsWith("CANCEL_ORDER_"))
+            {
+                var parts = data.Split('_');
+                var symbol = parts[2];
+                if (long.TryParse(parts[3], out var orderId))
+                {
+                    bool cancelled = false;
+                    lock (_dataLock)
+                    {
+                        if (Market.TryGetValue(symbol, out var c))
+                        {
+                            var o = c.Orders.FirstOrDefault(x => x.UserId == userId && x.Timestamp.Ticks == orderId);
+                            if (o != null)
+                            {
+                                if (o.Type == "BUY")
+                                {
+                                    user.Balance += (o.Price * o.Quantity) * 1.01m; // بازگشت مبلغ مسدودشده
+                                }
+                                else if (o.Type == "SELL")
+                                {
+                                    if (!user.Portfolio.ContainsKey(symbol)) user.Portfolio[symbol] = 0;
+                                    user.Portfolio[symbol] += o.Quantity; // بازگشت سهام مسدودشده
+                                }
+                                c.Orders.Remove(o);
+                                cancelled = true;
+                            }
+                        }
+                    }
+                    if (cancelled)
+                    {
+                        RequestSave();
+                        await bot.SendMessage(chatId, $"✅ سفارش شما با موفقیت از تابلوی معاملاتی {symbol} لغو شد.", cancellationToken: ct);
+                        await SendUserOpenOrdersAsync(bot, chatId, userId, symbol, ct);
+                    }
+                    else
+                    {
+                        await bot.SendMessage(chatId, "❌ سفارش مورد نظر یافت نشد یا قبلاً معامله شده است.", cancellationToken: ct);
+                    }
+                }
+            }
             else if (data.StartsWith("CHART_"))
             {
                 var symbol = data.Split('_')[1];
                 await SendGraphicChartAsync(bot, chatId, symbol, ct);
+            }
+            else if (data.StartsWith("LIMIT_BUY_INPUT_"))
+            {
+                var symbol = data.Split('_')[3];
+                UserStates[chatId] = $"LIMIT_BUY_QTY_{symbol}";
+                await bot.SendMessage(chatId, $"🛒 لطفاً تعداد واحد مورد نظر برای سفارش‌گذاری خرید (Limit) روی تابلو {symbol} را وارد کنید:", cancellationToken: ct);
+            }
+            else if (data.StartsWith("LIMIT_SELL_INPUT_"))
+            {
+                var symbol = data.Split('_')[3];
+                UserStates[chatId] = $"LIMIT_SELL_QTY_{symbol}";
+                var hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                await bot.SendMessage(chatId, $"💰 لطفاً تعداد واحد مورد نظر برای سفارش‌گذاری فروش (Limit) روی تابلو {symbol} را وارد کنید (موجودی: {hasStock:N0} واحد):", cancellationToken: ct);
             }
             else if (data.StartsWith("BUY_MENU_"))
             {
@@ -1957,6 +2143,159 @@ namespace StockBotApp
         }
 
         // ===================== HELPER METHODS & UI CARDS =====================
+        private static async Task SendBoardSelectorAsync(ITelegramBotClient bot, long chatId, CancellationToken ct)
+        {
+            string msg = "📋 **منوی انتخاب تابلوی معاملاتی لایو (بورس همتا به همتا - P2P):**\n\n" +
+                         "برای مشاهده صف خرید و فروش، کمترین قیمت فروشنده و بیشترین قیمت خریدار هر ارز، روی نماد مورد نظر کلیک کنید:";
+
+            List<InlineKeyboardButton> symbolButtons;
+            lock (_dataLock)
+            {
+                symbolButtons = Market.Keys.Select(sym =>
+                    InlineKeyboardButton.WithCallbackData($"📋 تابلوی {sym} ({FmtPrice(GetCurrentPrice(sym))})", $"BOARD_{sym}")
+                ).ToList();
+            }
+
+            var rows = new List<InlineKeyboardButton[]>();
+            for (int i = 0; i < symbolButtons.Count; i += 2)
+            {
+                if (i + 1 < symbolButtons.Count)
+                    rows.Add(new[] { symbolButtons[i], symbolButtons[i + 1] });
+                else
+                    rows.Add(new[] { symbolButtons[i] });
+            }
+
+            await bot.SendMessage(chatId, msg, parseMode: ParseMode.Markdown, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
+        }
+
+        private static async Task SendTradingBoardAsync(ITelegramBotClient bot, long chatId, string symbol, CancellationToken ct)
+        {
+            Currency? cCopy = null;
+            List<Order> buyOrders = new();
+            List<Order> sellOrders = new();
+            decimal curPrice = 0m;
+            long ipoLeft = 0;
+
+            lock (_dataLock)
+            {
+                if (Market.TryGetValue(symbol, out var c))
+                {
+                    cCopy = c;
+                    curPrice = GetCurrentPrice(symbol);
+                    buyOrders = c.Orders.Where(o => o.Type == "BUY" && o.Quantity > 0).OrderByDescending(o => o.Price).Take(5).ToList();
+                    sellOrders = c.Orders.Where(o => o.Type == "SELL" && o.Quantity > 0).OrderBy(o => o.Price).Take(5).ToList();
+                    ipoLeft = c.Orders.Where(o => o.Type == "SELL" && o.UserId == 0).Sum(o => o.Quantity);
+                }
+            }
+
+            if (cCopy == null)
+            {
+                await bot.SendMessage(chatId, $"❌ ارز {symbol} یافت نشد.", cancellationToken: ct);
+                return;
+            }
+
+            string msg = $"📋 **تابلوی معاملاتی لایو (بورس همتا به همتا) — {cCopy.Symbol}**\n\n" +
+                         $"💵 آخرین قیمت معامله: **{FmtPrice(curPrice)}**\n" +
+                         $"💎 قیمت پایه (عرضه اولیه): {FmtPrice(cCopy.BaseValue)}\n" +
+                         $"🏦 سهام باقی‌مانده عرضه اولیه خزانه: **{ipoLeft:N0}** واحد\n\n" +
+                         $"═════════════════════════\n" +
+                         $"🟢 **صف خرید (Bids — تقاضا):**\n" +
+                         $"حجم | قیمت واحد | خریدار\n" +
+                         $"-------------------------\n";
+
+            if (buyOrders.Count == 0)
+            {
+                msg += "*(صف خرید خالی است)*\n";
+            }
+            else
+            {
+                foreach (var o in buyOrders)
+                {
+                    string uName = (Users.TryGetValue(o.UserId, out var u) ? $"@{u.Username}" : $"{o.UserId}");
+                    msg += $"**{o.Quantity:N0}** واحد | **{FmtPrice(o.Price)}** | {uName}\n";
+                }
+            }
+
+            msg += $"═════════════════════════\n" +
+                   $"🔴 **صف فروش (Asks — عرضه):**\n" +
+                   $"حجم | قیمت واحد | فروشنده\n" +
+                   $"-------------------------\n";
+
+            if (sellOrders.Count == 0)
+            {
+                msg += "*(صف فروش خالی است)*\n";
+            }
+            else
+            {
+                foreach (var o in sellOrders)
+                {
+                    string uName = o.UserId == 0 ? "🏦 خزانه (عرضه اولیه)" : (Users.TryGetValue(o.UserId, out var u) ? $"@{u.Username}" : $"{o.UserId}");
+                    msg += $"**{o.Quantity:N0}** واحد | **{FmtPrice(o.Price)}** | {uName}\n";
+                }
+            }
+
+            msg += $"═════════════════════════\n" +
+                   $"💡 *در بازار P2P، سفارش شما با کمترین قیمت فروشنده یا بیشترین قیمت خریدار معامله می‌شود؛ مگر اینکه در قیمت دلخواه سفارش بگذارید.*";
+
+            var kb = new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("🛒 ثبت سفارش خرید (Limit)", $"LIMIT_BUY_INPUT_{symbol}"),
+                    InlineKeyboardButton.WithCallbackData("💰 ثبت سفارش فروش (Limit)", $"LIMIT_SELL_INPUT_{symbol}")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("🛒 خرید فوری از سرخط", $"BUY_MENU_{symbol}"),
+                    InlineKeyboardButton.WithCallbackData("💰 فروش فوری به سرخط", $"SELL_MENU_{symbol}")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("📋 سفارش‌های من (لغو)", $"MY_ORDERS_{symbol}"),
+                    InlineKeyboardButton.WithCallbackData("🔄 به‌روزرسانی تابلو", $"BOARD_{symbol}")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("🔙 بازگشت به پنل ارز", $"VIEW_SYMBOL_{symbol}")
+                }
+            });
+
+            await bot.SendMessage(chatId, msg, parseMode: ParseMode.Markdown, replyMarkup: kb, cancellationToken: ct);
+        }
+
+        private static async Task SendUserOpenOrdersAsync(ITelegramBotClient bot, long chatId, long userId, string symbol, CancellationToken ct)
+        {
+            List<Order> userOrders = new();
+            lock (_dataLock)
+            {
+                if (Market.TryGetValue(symbol, out var c))
+                {
+                    userOrders = c.Orders.Where(o => o.UserId == userId).ToList();
+                }
+            }
+
+            if (userOrders.Count == 0)
+            {
+                await bot.SendMessage(chatId, $"📋 شما هیچ سفارش بازی در تابلوی معاملاتی {symbol} ندارید.", cancellationToken: ct);
+                return;
+            }
+
+            string msg = $"📋 **سفارش‌های باز شما در تابلوی معاملاتی {symbol}:**\n\n" +
+                         $"برای لغو هر سفارش و بازگشت وجه/سهام مسدودشده، روی دکمه لغو مربوطه کلیک کنید:\n";
+
+            var rows = new List<InlineKeyboardButton[]>();
+            foreach (var o in userOrders)
+            {
+                string typeName = o.Type == "BUY" ? "خرید 🛒" : "فروش 💰";
+                msg += $"• [{typeName}] **{o.Quantity:N0}** واحد به قیمت **{FmtPrice(o.Price)}**\n";
+                rows.Add(new[] { InlineKeyboardButton.WithCallbackData($"❌ لغو سفارش {typeName} ({o.Quantity} واحد @ {FmtPrice(o.Price)})", $"CANCEL_ORDER_{symbol}_{o.Timestamp.Ticks}") });
+            }
+
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🔙 بازگشت به تابلو", $"BOARD_{symbol}") });
+
+            await bot.SendMessage(chatId, msg, parseMode: ParseMode.Markdown, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
+        }
+
         private static async Task SendSymbolCardAsync(ITelegramBotClient bot, long chatId, string symbol, CancellationToken ct)
         {
             Currency? cCopy = null;
@@ -2001,6 +2340,10 @@ namespace StockBotApp
                 {
                     InlineKeyboardButton.WithCallbackData("🛒 خرید فوری", $"BUY_MENU_{symbol}"),
                     InlineKeyboardButton.WithCallbackData("💰 فروش فوری", $"SELL_MENU_{symbol}")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("📋 تابلوی معاملاتی لایو (بورس P2P)", $"BOARD_{symbol}")
                 },
                 new[]
                 {
@@ -2246,7 +2589,7 @@ namespace StockBotApp
         {
             var rows = new List<KeyboardButton[]>
             {
-                new KeyboardButton[] { "📊 بازار و قیمت‌ها", "💼 پرتفو من", "💰 موجودی من" },
+                new KeyboardButton[] { "📊 بازار و قیمت‌ها", "📋 تابلوی معاملاتی", "💼 پرتفو من" },
                 new KeyboardButton[] { "🛒 خرید سهام", "💰 فروش سهام", "📈 نمودار و چارت" },
                 new KeyboardButton[] { "🏆 لیدربورد برترین‌ها", "🎁 دعوت دوستان", "📖 راهنمای بات" }
             };
@@ -2279,7 +2622,8 @@ namespace StockBotApp
 
 ---
 🔘 دکمه‌های منوی پایین صفحه:
-• 📊 بازار و قیمت‌ها: مشاهده لیست قیمت‌های لحظه‌ای بازار و ورود به صفحه اختصاصی هر ارز همراه با عکس و امکان خرید/فروش فوری
+• 📊 بازار و قیمت‌ها: مشاهده لیست قیمت‌های لحظه‌ای بازار و ورود به صفحه اختصاصی هر ارز همراه با عکس
+• 📋 تابلوی معاملاتی: مشاهده تابلوی معاملاتی لایو (بورس همتا به همتا - P2P) شامل صف خرید، صف فروش، حجم‌ها و سفارش‌گذاری با قیمت دلخواه (Limit)
 • 💼 پرتفو من: مشاهده سبد دارایی‌ها و ارزش کل حساب ($)
 • 💰 موجودی من: مشاهده موجودی نقدی دلار ($) و سطح کاربری (Level / XP)
 • 🛒 خرید سهام و 💰 فروش سهام: منوی سریع خرید و فروش هر ارز
@@ -2290,6 +2634,7 @@ namespace StockBotApp
 ---
 ⌨️ دستورات متنی سریع (بدون اسلش):
 • بازار — مشاهده بازار و قیمت‌ها
+• تابلو BTC — مشاهده تابلوی معاملاتی لایو بیت‌کوین
 • خرید BTC 10 65000 — خرید ۱۰ واحد بیت‌کوین به قیمت واحد ۶۵۰۰۰ دلار
 • فروش BTC 5 65000 — فروش ۵ واحد بیت‌کوین به قیمت واحد ۶۵۰۰۰ دلار
 • چارت BTC — دریافت نمودار گرافیکی بیت‌کوین
@@ -2298,9 +2643,10 @@ namespace StockBotApp
 • موجودی — مشاهده موجودی دلار
 
 ---
-💡 نکات مهم:
-۱. 🏦 نقدینگی اولیه و قیمت پایه تمام ارزها توسط خزانه مرکزی در اوردربوک تأمین شده است؛ شما در هر لحظه می‌توانید با یک کلیک خرید و فروش کنید!
-۲. 🌙 پاداش شبانه: هر شب ساعت ۱۲ (به وقت تهران)، اگر موجودی نقدی شما کمتر از $5,000 باشد، مبلغ $1,000 هدیه به حسابتان واریز می‌شود!";
+💡 سازوکار بورس همتا به همتا (P2P):
+۱. 🏦 عرضه اولیه خزانه: خریدها تا زمانی که سهام اولیه خزانه دست مردم نیفتاده باشد به صورت آنی از خزانه انجام می‌شود. پس از اتمام سهام خزانه، خرید فقط همتا به همتا (P2P) خواهد بود!
+۲. 🤝 فروش سهام همیشه ۱۰۰٪ همتا به همتا است: سفارش فروش شما در تابلوی معاملاتی (صف فروش) ثبت می‌شود و توسط خریداران واقعی معامله خواهد شد.
+۳. 🌙 پاداش شبانه: هر شب ساعت ۱۲ (به وقت تهران)، اگر موجودی نقدی شما کمتر از $5,000 باشد، مبلغ $1,000 هدیه به حسابتان واریز می‌شود!";
         }
 
         // ===================== MATCHING ENGINE =====================
