@@ -599,6 +599,14 @@ namespace StockBotApp
                 if (c.Symbol == null) c.Symbol = "";
                 if (c.Description == null) c.Description = c.Symbol;
                 if (c.PhotoUrl == null) c.PhotoUrl = "";
+                if (c.CreatedAt < DateTime.UtcNow.AddDays(-3)) c.CreatedAt = DateTime.UtcNow.AddHours(-12);
+                if (c.TimedPriceHistory != null)
+                {
+                    foreach (var pt in c.TimedPriceHistory)
+                    {
+                        if (pt.Timestamp < DateTime.UtcNow.AddDays(-3)) pt.Timestamp = DateTime.UtcNow.AddHours(-12);
+                    }
+                }
             }
 
             foreach (var u in Users.Values)
@@ -787,10 +795,10 @@ namespace StockBotApp
                     TotalSupply = totalSupply,
                     CirculatingSupply = totalSupply / 2,
                     PhotoUrl = photoUrl,
-                    CreatedAt = DateTime.UtcNow.AddDays(-14)
+                    CreatedAt = DateTime.UtcNow.AddHours(-6)
                 };
                 currency.PriceHistory.Add(baseValue);
-                currency.TimedPriceHistory.Add(new PricePoint { Timestamp = DateTime.UtcNow.AddDays(-14), Price = baseValue });
+                currency.TimedPriceHistory.Add(new PricePoint { Timestamp = DateTime.UtcNow.AddHours(-6), Price = baseValue });
                 currency.TimedPriceHistory.Add(new PricePoint { Timestamp = DateTime.UtcNow, Price = baseValue });
                 Market[symbol] = currency;
             }
