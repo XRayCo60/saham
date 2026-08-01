@@ -2956,6 +2956,29 @@ namespace StockBotApp
             string changeSign = changePct >= 0 ? "+" : "";
             string shamsiTime = GetShamsiTehranTime(DateTime.UtcNow);
 
+            // توزیع زمانی نرم و سعودی برای نقاط تا هرگز روی هم (عمودی) انباشته نشوند و نمودار کاملاً کشیده و تمیز رسم شود
+            DateTime endDt = DateTime.UtcNow;
+            DateTime startDt = endDt.AddHours(-24);
+            switch (timeframe.ToUpper())
+            {
+                case "3H": startDt = endDt.AddHours(-3); break;
+                case "12H": startDt = endDt.AddHours(-12); break;
+                case "24H": startDt = endDt.AddHours(-24); break;
+                case "3D": startDt = endDt.AddDays(-3); break;
+                case "7D": startDt = endDt.AddDays(-7); break;
+                case "30D": startDt = endDt.AddDays(-30); break;
+                default: startDt = endDt.AddDays(-14); break;
+            }
+            if (timePoints.Length > 1 && timePoints.First() < startDt)
+                startDt = timePoints.First();
+
+            double totalSeconds = Math.Max(1800, (endDt - startDt).TotalSeconds);
+            double stepSec = totalSeconds / Math.Max(1, prices.Length - 1);
+            for (int i = 0; i < timePoints.Length; i++)
+            {
+                timePoints[i] = startDt.AddSeconds(i * stepSec);
+            }
+
             try
             {
                 double[] xs = timePoints.Select(dt => dt.ToOADate()).ToArray();
@@ -2964,10 +2987,12 @@ namespace StockBotApp
                 var plt = new Plot();
                 var scatter = plt.Add.Scatter(xs, ys);
                 scatter.LineWidth = 2.5f;
-                scatter.MarkerSize = 5;
+                scatter.MarkerSize = prices.Length > 35 ? 3 : 6;
+                scatter.Color = ScottPlot.Color.FromHex("#1f77b4");
+                plt.Grid.MajorLineColor = ScottPlot.Colors.LightGray.WithAlpha(0.35);
 
-                plt.Axes.DateTimeTicksBottom(); // تبدیل هوشمند محور افقی به تاریخ و ساعت واقعی
-                plt.Title($"{symbol} / USD — {timeframe.ToUpper()} Chart");
+                plt.Axes.DateTimeTicksBottom(); // نمایش ساعت و تاریخ واقعی بدون هم‌پوشانی
+                plt.Title($"{symbol} / USD — {timeframe.ToUpper()} Timeframe");
                 plt.XLabel("Time (Tehran Time — HH:mm / Date)");
                 plt.YLabel("Price ($ USD)");
                 plt.Axes.Left.Label.Text = "Price ($)";
