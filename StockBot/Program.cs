@@ -2252,6 +2252,14 @@ namespace StockBotApp
                                 $"👥 دوستان دعوت‌شده: {user.Referrals} نفر";
                 await bot.SendMessage(chatId, refMsg, cancellationToken: ct);
             }
+            else if (data == "REFRESH_PORTFOLIO")
+            {
+                await SendUserPortfolioAsync(bot, chatId, userId, ct);
+            }
+            else if (data == "VIEW_MARKET")
+            {
+                await SendMarketOverviewAsync(bot, chatId, ct);
+            }
         }
 
         // ===================== HELPER METHODS & UI CARDS =====================
@@ -2435,6 +2443,78 @@ namespace StockBotApp
             }
 
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🔙 بازگشت به تابلو", $"BOARD_{symbol}") });
+
+            await bot.SendMessage(chatId, msg, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
+        }
+
+        private static async Task SendUserPortfolioAsync(ITelegramBotClient bot, long chatId, long userId, CancellationToken ct)
+        {
+            User? uCopy = null;
+            var holdings = new List<(string Symbol, long Qty, decimal Price, decimal Value)>();
+            decimal balance = 0m;
+
+            lock (_dataLock)
+            {
+                if (Users.TryGetValue(userId, out var u) && u != null)
+                {
+                    uCopy = u;
+                    balance = u.Balance;
+                    foreach (var h in u.Portfolio.Where(x => x.Value > 0))
+                    {
+                        decimal curPrice = GetCurrentPrice(h.Key);
+                        decimal val = curPrice * h.Value;
+                        holdings.Add((h.Key, h.Value, curPrice, val));
+                    }
+                }
+            }
+
+            if (uCopy == null) return;
+
+            decimal totalStockVal = holdings.Sum(x => x.Value);
+            decimal netWorth = balance + totalStockVal;
+
+            string msg = $"💼 پرتفو و سبد دارایی اختصاصی — @{uCopy.Username}\n\n" +
+                         $"💵 موجودی نقدی دلار (Cash): {FmtMoney(balance)}\n" +
+                         $"💎 مجموع ارزش سهام‌ها (Stock): {FmtMoney(totalStockVal)}\n" +
+                         $"🏆 ارزش کل دارایی حساب (Net Worth): {FmtMoney(netWorth)}\n\n" +
+                         $"━━━━━━━━━━━━━━━━━━━━━━\n";
+
+            if (holdings.Count == 0)
+            {
+                msg += "🔹 شما در حال حاضر هیچ سهامی در سبد دارایی خود ندارید.\n" +
+                       "💡 برای شروع معاملات و خرید سهام، روی دکمه‌های زیر کلیک کنید:\n" +
+                       $"━━━━━━━━━━━━━━━━━━━━━━";
+            }
+            else
+            {
+                msg += "📦 تفکیک سهام‌های خریداری‌شده در سبد:\n\n";
+                foreach (var h in holdings.OrderByDescending(x => x.Value))
+                {
+                    decimal sharePct = totalStockVal > 0 ? (h.Value / totalStockVal) * 100m : 0m;
+                    msg += $"┌ 🏷 نماد: {h.Symbol} — (سهم از سبد سهام: {sharePct:N1}%)\n" +
+                           $"├ 📦 موجودی سهام: {h.Qty:N0} واحد\n" +
+                           $"├ 💵 قیمت واحد لحظه‌ای: {FmtPrice(h.Price)}\n" +
+                           $"└ 💎 ارزش کل این سهم: {FmtMoney(h.Value)}\n\n";
+                }
+                msg += $"━━━━━━━━━━━━━━━━━━━━━━\n" +
+                       $"💡 برای فروش در تابلو P2P یا مشاهده تابلوی معاملاتی هر سهم، روی دکمه مربوطه کلیک کنید:";
+            }
+
+            var rows = new List<InlineKeyboardButton[]>();
+            foreach (var h in holdings.Take(5))
+            {
+                rows.Add(new[]
+                {
+                    InlineKeyboardButton.WithCallbackData($"💰 فروش P2P {h.Symbol}", $"LIMIT_SELL_INPUT_{h.Symbol}"),
+                    InlineKeyboardButton.WithCallbackData($"📋 تابلوی {h.Symbol}", $"BOARD_{h.Symbol}")
+                });
+            }
+
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData("📊 بازار و قیمت‌ها", "VIEW_MARKET"),
+                InlineKeyboardButton.WithCallbackData("🔄 به‌روزرسانی پرتفو", "REFRESH_PORTFOLIO")
+            });
 
             await bot.SendMessage(chatId, msg, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
         }
