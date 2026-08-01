@@ -674,8 +674,9 @@ namespace StockBotApp
             decimal curPrice = GetCurrentPrice(symbol);
             if (curPrice <= 0) curPrice = currency.BaseValue > 0 ? currency.BaseValue : 1m;
 
-            // ایجاد یا احیای سفارش فروش اولیه خزانه در قیمت جاری بازار
-            if (!currency.Orders.Any(o => o.Type == "SELL" && o.UserId == 0 && o.Quantity > 0))
+            // ایجاد یا همگام‌سازی اجباری قیمت سفارش فروش خزانه با قیمت لحظه‌ای بازار
+            var treasurySell = currency.Orders.FirstOrDefault(o => o.Type == "SELL" && o.UserId == 0 && o.Quantity > 0);
+            if (treasurySell == null)
             {
                 long ipoQty = currency.CirculatingSupply;
                 if (ipoQty <= 0) ipoQty = Math.Max(1000, currency.TotalSupply / 10);
@@ -688,13 +689,18 @@ namespace StockBotApp
                     Timestamp = DateTime.UtcNow
                 });
             }
+            else
+            {
+                treasurySell.Price = curPrice;
+            }
 
-            // ایجاد سفارش خرید تضمینی جهت نقدشوندگی فوری کاربران (۵٪ زیر قیمت جاری بازار)
-            if (!currency.Orders.Any(o => o.Type == "BUY" && o.UserId == 0 && o.Quantity > 0))
+            // ایجاد یا همگام‌سازی اجباری قیمت سفارش خرید خزانه (۵٪ زیر قیمت جاری بازار)
+            decimal buyPrice = Math.Max(0.01m, curPrice * 0.95m);
+            var treasuryBuy = currency.Orders.FirstOrDefault(o => o.Type == "BUY" && o.UserId == 0 && o.Quantity > 0);
+            if (treasuryBuy == null)
             {
                 long buyQty = currency.CirculatingSupply;
                 if (buyQty <= 0) buyQty = Math.Max(1000, currency.TotalSupply / 10);
-                decimal buyPrice = Math.Max(0.01m, curPrice * 0.95m);
                 currency.Orders.Add(new Order
                 {
                     UserId = 0,
@@ -703,6 +709,10 @@ namespace StockBotApp
                     Quantity = buyQty,
                     Timestamp = DateTime.UtcNow
                 });
+            }
+            else
+            {
+                treasuryBuy.Price = buyPrice;
             }
 
             if (!Users[0].Portfolio.ContainsKey(symbol) || Users[0].Portfolio[symbol] < currency.CirculatingSupply)
@@ -2306,7 +2316,7 @@ namespace StockBotApp
                 foreach (var sell in sells)
                 {
                     if (buy.Quantity <= 0 || sell.Quantity <= 0) continue;
-                    if (buy.Price >= sell.Price)
+                    if (buy.Price >= sell.Price || (sell.UserId == 0 && buy.Price >= sell.Price * 0.98m) || (buy.UserId == 0 && sell.Price <= buy.Price * 1.02m))
                     {
                         var matchQty = Math.Min(buy.Quantity, sell.Quantity);
                         var tradePrice = sell.Price;
