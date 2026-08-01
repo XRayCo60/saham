@@ -1,11 +1,12 @@
-// StockBot.cs - Naomi (نائومی) Telegram Trading Bot (Dynamic AMM Price Impact + Flexible Buy/Sell UI)
+// StockBot.cs - Naomi (نائومی) Telegram Trading Bot (Anti-Freeze SocketsHttpHandler + Thread-Safe Concurrency)
 // تک‌فایل C# کامل - بدون هیچ دستوری که با / شروع شود
-// مجهز به دیتابیس دوگانه، قیمت‌گذاری پویا بر اساس عرضه و تقاضا، و امکان خرید/فروش هر تعداد واحد دلخواه
+// مجهز به کانکشن‌پلینگ ضد فریز (TCP Keep-Alive)، قفل‌های هم‌زمانی ایمن، قیمت‌گذاری پویا و خرید/فروش هر تعداد واحد دلخواه
 
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
@@ -296,7 +297,22 @@ namespace StockBotApp
             try { SQLitePCL.Batteries.Init(); } catch { }
 
             LoadData();
-            Bot = new TelegramBotClient(Token);
+
+            // تنظیم SocketsHttpHandler با پینّگ‌های مداوم TCP Keep-Alive جهت جلوگیری از فریز شدن یا دراپ شدن کانکشن در سرورهای لینوکس
+            var handler = new SocketsHttpHandler
+            {
+                PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(1),
+                KeepAlivePingDelay = TimeSpan.FromSeconds(15),
+                KeepAlivePingTimeout = TimeSpan.FromSeconds(5),
+                EnableMultipleHttp2Connections = true
+            };
+            var httpClient = new HttpClient(handler)
+            {
+                Timeout = TimeSpan.FromSeconds(45)
+            };
+
+            Bot = new TelegramBotClient(Token, httpClient);
 
             // حذف وب‌هوک قدیمی احتمالی برای اطمینان از عملکرد ۱۰۰٪ Polling
             try { await Bot.DeleteWebhook(cancellationToken: CancellationToken.None); } catch { }
@@ -666,23 +682,28 @@ namespace StockBotApp
                 var userId = message.From.Id;
                 var text = message.Text?.Trim() ?? "";
 
-                if (!Users.TryGetValue(userId, out var user) || user == null)
+                User user;
+                lock (_dataLock)
                 {
-                    user = new User
+                    if (!Users.TryGetValue(userId, out var u) || u == null)
                     {
-                        UserId = userId,
-                        Username = message.From.Username ?? "unknown",
-                        Balance = 5000m,
-                        Level = 1,
-                        XP = 0
-                    };
-                    user.DeviceFingerprints.Add(userId % 100000);
-                    user.ReferralCode = "REF" + userId.ToString().Substring(Math.Max(0, userId.ToString().Length - 6));
-                    Users[userId] = user;
-                }
-                else if (message.From.Username != null)
-                {
-                    user.Username = message.From.Username;
+                        u = new User
+                        {
+                            UserId = userId,
+                            Username = message.From.Username ?? "unknown",
+                            Balance = 5000m,
+                            Level = 1,
+                            XP = 0
+                        };
+                        u.DeviceFingerprints.Add(userId % 100000);
+                        u.ReferralCode = "REF" + userId.ToString().Substring(Math.Max(0, userId.ToString().Length - 6));
+                        Users[userId] = u;
+                    }
+                    else if (message.From.Username != null)
+                    {
+                        u.Username = message.From.Username;
+                    }
+                    user = u;
                 }
 
                 // مدیریت وضعیت‌های خاص (مانند ارسال عکس، متن یا وارد کردن مقدار دلخواه خرید و فروش)
@@ -790,18 +811,21 @@ namespace StockBotApp
                 var photoUrl = parts[5];
                 string desc = (text.Equals("none", StringComparison.OrdinalIgnoreCase)) ? symbol : text;
 
-                var c = new Currency
+                lock (_dataLock)
                 {
-                    Symbol = symbol,
-                    Description = desc,
-                    TotalSupply = supply,
-                    BaseValue = baseVal,
-                    CirculatingSupply = supply / 2,
-                    PhotoUrl = photoUrl
-                };
-                c.PriceHistory.Add(baseVal);
-                Market[symbol] = c;
-                EnsureInitialLiquidity(symbol);
+                    var c = new Currency
+                    {
+                        Symbol = symbol,
+                        Description = desc,
+                        TotalSupply = supply,
+                        BaseValue = baseVal,
+                        CirculatingSupply = supply / 2,
+                        PhotoUrl = photoUrl
+                    };
+                    c.PriceHistory.Add(baseVal);
+                    Market[symbol] = c;
+                    EnsureInitialLiquidity(symbol);
+                }
 
                 UserStates.Remove(chatId);
                 await bot.SendMessage(
@@ -814,12 +838,15 @@ namespace StockBotApp
             }
             else if (state == "REMOVE_CURRENCY")
             {
-                if (Market.ContainsKey(text.ToUpper()))
+                lock (_dataLock)
                 {
-                    Market.Remove(text.ToUpper());
-                    UserStates.Remove(chatId);
-                    await bot.SendMessage(chatId, "✅ ارز مورد نظر با موفقیت حذف شد.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
-                    return true;
+                    if (Market.ContainsKey(text.ToUpper()))
+                    {
+                        Market.Remove(text.ToUpper());
+                        UserStates.Remove(chatId);
+                        await bot.SendMessage(chatId, "✅ ارز مورد نظر با موفقیت حذف شد.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        return true;
+                    }
                 }
             }
             else if (state == "SET_PRICE_SYMBOL")
@@ -835,12 +862,18 @@ namespace StockBotApp
             else if (state.StartsWith("SET_PRICE_"))
             {
                 var symbol = state.Split('_')[2];
-                if (decimal.TryParse(text, out var newPrice) && Market.ContainsKey(symbol))
+                if (decimal.TryParse(text, out var newPrice))
                 {
-                    Market[symbol].PriceHistory.Add(newPrice);
-                    UserStates.Remove(chatId);
-                    await bot.SendMessage(chatId, $"✅ قیمت ارز {symbol} به {FmtPrice(newPrice)} تغییر یافت.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
-                    return true;
+                    lock (_dataLock)
+                    {
+                        if (Market.ContainsKey(symbol))
+                        {
+                            Market[symbol].PriceHistory.Add(newPrice);
+                            UserStates.Remove(chatId);
+                            await bot.SendMessage(chatId, $"✅ قیمت ارز {symbol} به {FmtPrice(newPrice)} تغییر یافت.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                            return true;
+                        }
+                    }
                 }
             }
             else if (state == "SET_PHOTO_SYMBOL")
@@ -862,12 +895,15 @@ namespace StockBotApp
                 else if (!string.IsNullOrWhiteSpace(text))
                     photoUrl = text;
 
-                if (Market.ContainsKey(symbol) && !string.IsNullOrWhiteSpace(photoUrl))
+                lock (_dataLock)
                 {
-                    Market[symbol].PhotoUrl = photoUrl;
-                    UserStates.Remove(chatId);
-                    await bot.SendMessage(chatId, $"✅ تصویر/آیکون ارز {symbol} با موفقیت تنظیم شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
-                    return true;
+                    if (Market.ContainsKey(symbol) && !string.IsNullOrWhiteSpace(photoUrl))
+                    {
+                        Market[symbol].PhotoUrl = photoUrl;
+                        UserStates.Remove(chatId);
+                        await bot.SendMessage(chatId, $"✅ تصویر/آیکون ارز {symbol} با موفقیت تنظیم شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        return true;
+                    }
                 }
             }
             else if (state == "SET_DESC_SYMBOL")
@@ -883,36 +919,59 @@ namespace StockBotApp
             else if (state.StartsWith("SET_DESC_TEXT_"))
             {
                 var symbol = state.Split('_')[3];
-                if (Market.ContainsKey(symbol))
+                lock (_dataLock)
                 {
-                    Market[symbol].Description = text;
-                    UserStates.Remove(chatId);
-                    await bot.SendMessage(chatId, $"✅ توضیحات ارز {symbol} با موفقیت به‌روزرسانی شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
-                    return true;
+                    if (Market.ContainsKey(symbol))
+                    {
+                        Market[symbol].Description = text;
+                        UserStates.Remove(chatId);
+                        await bot.SendMessage(chatId, $"✅ توضیحات ارز {symbol} با موفقیت به‌روزرسانی شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        return true;
+                    }
                 }
             }
             else if (state.StartsWith("CUSTOM_BUY_QTY_"))
             {
                 var symbol = state.Split('_')[3];
-                if (long.TryParse(text, out var qty) && qty > 0 && Market.TryGetValue(symbol, out var c))
+                if (long.TryParse(text, out var qty) && qty > 0)
                 {
-                    var user = Users[message.From!.Id];
-                    var price = GetCurrentPrice(symbol);
-                    decimal totalCost = price * qty * 1.01m; // ۱٪ کارمزد
-                    if (user.Balance < totalCost)
+                    User user;
+                    decimal price;
+                    bool canBuy = false;
+                    decimal totalCost = 0m;
+                    lock (_dataLock)
                     {
-                        await bot.SendMessage(chatId, $"❌ موجودی نقدی دلار شما کافی نیست.\nمبلغ مورد نیاز با کارمزد: {FmtMoney(totalCost)}\nموجودی شما: {FmtMoney(user.Balance)}", cancellationToken: ct);
+                        if (Market.TryGetValue(symbol, out var c))
+                        {
+                            user = Users[message.From!.Id];
+                            price = GetCurrentPrice(symbol);
+                            totalCost = price * qty * 1.01m;
+                            if (user.Balance >= totalCost)
+                            {
+                                canBuy = true;
+                                var order = new Order { UserId = user.UserId, Type = "BUY", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
+                                c.Orders.Add(order);
+                                MatchOrders(symbol, user.UserId);
+                            }
+                        }
+                        else
+                        {
+                            return false;
+                        }
+                    }
+
+                    if (!canBuy)
+                    {
+                        await bot.SendMessage(chatId, $"❌ موجودی نقدی دلار شما کافی نیست.\nمبلغ مورد نیاز با کارمزد: {FmtMoney(totalCost)}", cancellationToken: ct);
                     }
                     else
                     {
-                        var order = new Order { UserId = user.UserId, Type = "BUY", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
-                        c.Orders.Add(order);
-                        MatchOrders(symbol, user.UserId);
                         RequestSave();
+                        var u = Users[message.From!.Id];
                         await bot.SendMessage(
                             chatId,
-                            $"✅ خرید فوری {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} با موفقیت انجام شد!\n💰 موجودی جدید دلار شما: {FmtMoney(user.Balance)}",
-                            replyMarkup: user.UserId == OwnerId ? GetOwnerKeyboard() : GetUserKeyboard(user.UserId),
+                            $"✅ خرید فوری {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(GetCurrentPrice(symbol))} با موفقیت انجام شد!\n💰 موجودی جدید دلار شما: {FmtMoney(u.Balance)}",
+                            replyMarkup: u.UserId == OwnerId ? GetOwnerKeyboard() : GetUserKeyboard(u.UserId),
                             cancellationToken: ct
                         );
                     }
@@ -928,25 +987,44 @@ namespace StockBotApp
             else if (state.StartsWith("CUSTOM_SELL_QTY_"))
             {
                 var symbol = state.Split('_')[3];
-                if (long.TryParse(text, out var qty) && qty > 0 && Market.TryGetValue(symbol, out var c))
+                if (long.TryParse(text, out var qty) && qty > 0)
                 {
-                    var user = Users[message.From!.Id];
-                    var hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
-                    if (hasStock < qty)
+                    bool canSell = false;
+                    long hasStock = 0;
+                    decimal price = 0m;
+                    lock (_dataLock)
+                    {
+                        if (Market.TryGetValue(symbol, out var c))
+                        {
+                            var user = Users[message.From!.Id];
+                            hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                            if (hasStock >= qty)
+                            {
+                                canSell = true;
+                                price = Math.Max(0.01m, GetCurrentPrice(symbol) * 0.95m);
+                                var order = new Order { UserId = user.UserId, Type = "SELL", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
+                                c.Orders.Add(order);
+                                MatchOrders(symbol, user.UserId);
+                            }
+                        }
+                        else
+                        {
+                            return false;
+                        }
+                    }
+
+                    if (!canSell)
                     {
                         await bot.SendMessage(chatId, $"❌ موجودی سهام {symbol} شما کافی نیست. موجودی شما: {hasStock:N0} واحد", cancellationToken: ct);
                     }
                     else
                     {
-                        var price = Math.Max(0.01m, GetCurrentPrice(symbol) * 0.95m);
-                        var order = new Order { UserId = user.UserId, Type = "SELL", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
-                        c.Orders.Add(order);
-                        MatchOrders(symbol, user.UserId);
                         RequestSave();
+                        var u = Users[message.From!.Id];
                         await bot.SendMessage(
                             chatId,
-                            $"✅ فروش فوری {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} با موفقیت انجام شد!\n💰 موجودی جدید دلار شما: {FmtMoney(user.Balance)}",
-                            replyMarkup: user.UserId == OwnerId ? GetOwnerKeyboard() : GetUserKeyboard(user.UserId),
+                            $"✅ فروش فوری {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} با موفقیت انجام شد!\n💰 موجودی جدید دلار شما: {FmtMoney(u.Balance)}",
+                            replyMarkup: u.UserId == OwnerId ? GetOwnerKeyboard() : GetUserKeyboard(u.UserId),
                             cancellationToken: ct
                         );
                     }
@@ -987,57 +1065,67 @@ namespace StockBotApp
             else if (text == "📊 مرور بازار")
             {
                 string msg = "👑 وضعیت کامل بازار در یک نگاه:\n\n";
-                foreach (var c in Market.Values)
+                lock (_dataLock)
                 {
-                    decimal price = GetCurrentPrice(c.Symbol);
-                    int sells = c.Orders.Count(o => o.Type == "SELL");
-                    int buys = c.Orders.Count(o => o.Type == "BUY");
-                    msg += $"🔸 {c.Symbol} | قیمت لحظه‌ای: {FmtPrice(price)} | قیمت پایه: {FmtPrice(c.BaseValue)}\n" +
-                           $"   عرضه در گردش: {c.CirculatingSupply:N0} / {c.TotalSupply:N0}\n" +
-                           $"   سفارشات باز: {sells} فروش | {buys} خرید\n\n";
+                    foreach (var c in Market.Values)
+                    {
+                        decimal price = GetCurrentPrice(c.Symbol);
+                        int sells = c.Orders.Count(o => o.Type == "SELL");
+                        int buys = c.Orders.Count(o => o.Type == "BUY");
+                        msg += $"🔸 {c.Symbol} | قیمت لحظه‌ای: {FmtPrice(price)} | قیمت پایه: {FmtPrice(c.BaseValue)}\n" +
+                               $"   عرضه در گردش: {c.CirculatingSupply:N0} / {c.TotalSupply:N0}\n" +
+                               $"   سفارشات باز: {sells} فروش | {buys} خرید\n\n";
+                    }
                 }
                 await bot.SendMessage(chatId, msg, replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
             }
             else if (text == "💰 موجودی کاربران")
             {
-                int totalUsers = Users.Count(u => u.Key != 0);
-                decimal totalCash = Users.Values.Where(u => u.UserId != 0).Sum(u => u.Balance);
-                decimal totalStockVal = 0m;
-                foreach (var u in Users.Values.Where(u => u.UserId != 0))
+                string msg;
+                lock (_dataLock)
                 {
-                    foreach (var p in u.Portfolio)
+                    int totalUsers = Users.Count(u => u.Key != 0);
+                    decimal totalCash = Users.Values.Where(u => u.UserId != 0).Sum(u => u.Balance);
+                    decimal totalStockVal = 0m;
+                    foreach (var u in Users.Values.Where(u => u.UserId != 0))
                     {
-                        totalStockVal += p.Value * GetCurrentPrice(p.Key);
+                        foreach (var p in u.Portfolio)
+                        {
+                            totalStockVal += p.Value * GetCurrentPrice(p.Key);
+                        }
                     }
-                }
 
-                string msg = $"👑 آمار کلی دارایی و موجودی کاربران:\n\n" +
-                             $"👥 تعداد کل معامله‌گران: {totalUsers:N0} نفر\n" +
-                             $"💵 مجموع دلار نقدی کاربران: {FmtMoney(totalCash)}\n" +
-                             $"📦 مجموع ارزش سهام دست مردم: {FmtMoney(totalStockVal)}\n" +
-                             $"💎 مجموع کل ارزش بازار دست مردم: {FmtMoney(totalCash + totalStockVal)}\n\n" +
-                             $"🔝 ۵ معامله‌گر برتر:\n";
+                    msg = $"👑 آمار کلی دارایی و موجودی کاربران:\n\n" +
+                          $"👥 تعداد کل معامله‌گران: {totalUsers:N0} نفر\n" +
+                          $"💵 مجموع دلار نقدی کاربران: {FmtMoney(totalCash)}\n" +
+                          $"📦 مجموع ارزش سهام دست مردم: {FmtMoney(totalStockVal)}\n" +
+                          $"💎 مجموع کل ارزش بازار دست مردم: {FmtMoney(totalCash + totalStockVal)}\n\n" +
+                          $"🔝 ۵ معامله‌گر برتر:\n";
 
-                var top5 = Users.Values
-                    .Where(u => u.UserId != 0)
-                    .OrderByDescending(u => u.Balance + u.Portfolio.Sum(p => p.Value * GetCurrentPrice(p.Key)))
-                    .Take(5)
-                    .ToList();
+                    var top5 = Users.Values
+                        .Where(u => u.UserId != 0)
+                        .OrderByDescending(u => u.Balance + u.Portfolio.Sum(p => p.Value * GetCurrentPrice(p.Key)))
+                        .Take(5)
+                        .ToList();
 
-                for (int i = 0; i < top5.Count; i++)
-                {
-                    var u = top5[i];
-                    decimal net = u.Balance + u.Portfolio.Sum(p => p.Value * GetCurrentPrice(p.Key));
-                    msg += $"{i + 1}. @{u.Username} — نقد: {FmtMoney(u.Balance)} | ارزش کل: {FmtMoney(net)}\n";
+                    for (int i = 0; i < top5.Count; i++)
+                    {
+                        var u = top5[i];
+                        decimal net = u.Balance + u.Portfolio.Sum(p => p.Value * GetCurrentPrice(p.Key));
+                        msg += $"{i + 1}. @{u.Username} — نقد: {FmtMoney(u.Balance)} | ارزش کل: {FmtMoney(net)}\n";
+                    }
                 }
 
                 await bot.SendMessage(chatId, msg, replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
             }
             else if (text == "🏦 تزریق نقدینگی")
             {
-                foreach (var symbol in Market.Keys.ToList())
+                lock (_dataLock)
                 {
-                    EnsureInitialLiquidity(symbol);
+                    foreach (var symbol in Market.Keys.ToList())
+                    {
+                        EnsureInitialLiquidity(symbol);
+                    }
                 }
                 await bot.SendMessage(
                     chatId,
@@ -1069,26 +1157,32 @@ namespace StockBotApp
             else if (text == "📋 سفارشات باز")
             {
                 string msg = "📋 دفترچه سفارشات فعال بازار (Order Book):\n\n";
-                foreach (var c in Market.Values)
+                lock (_dataLock)
                 {
-                    var topOrders = c.Orders.Take(5).ToList();
-                    if (topOrders.Count > 0)
+                    foreach (var c in Market.Values)
                     {
-                        msg += $"🔸 نماد {c.Symbol}:\n";
-                        foreach (var o in topOrders)
+                        var topOrders = c.Orders.Take(5).ToList();
+                        if (topOrders.Count > 0)
                         {
-                            string uName = o.UserId == 0 ? "خزانه مرکزی" : (Users.TryGetValue(o.UserId, out var u) ? $"@{u.Username}" : $"{o.UserId}");
-                            msg += $"   [{o.Type}] {o.Quantity:N0} واحد @ {FmtPrice(o.Price)} ({uName})\n";
+                            msg += $"🔸 نماد {c.Symbol}:\n";
+                            foreach (var o in topOrders)
+                            {
+                                string uName = o.UserId == 0 ? "خزانه مرکزی" : (Users.TryGetValue(o.UserId, out var u) ? $"@{u.Username}" : $"{o.UserId}");
+                                msg += $"   [{o.Type}] {o.Quantity:N0} واحد @ {FmtPrice(o.Price)} ({uName})\n";
+                            }
+                            msg += "\n";
                         }
-                        msg += "\n";
                     }
                 }
                 await bot.SendMessage(chatId, msg, replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
             }
             else if (text == "🔄 ریست بازار")
             {
-                Market.Clear();
-                EnsureDefaultCurrencies();
+                lock (_dataLock)
+                {
+                    Market.Clear();
+                    EnsureDefaultCurrencies();
+                }
                 await bot.SendMessage(
                     chatId,
                     "⚠️ بازار کاملاً ریست شد و ارزهای اصلی (BTC, ETH, SOL, TON, DOGE) به همراه نقدینگی اولیه مجدداً ایجاد شدند!",
@@ -1098,21 +1192,30 @@ namespace StockBotApp
             }
             else if (text == "🎲 رویداد تصادفی")
             {
-                if (Market.Count > 0)
+                string eventMsg = "";
+                List<long> uids;
+                lock (_dataLock)
                 {
-                    var random = new Random();
-                    var symbol = Market.Keys.ElementAt(random.Next(Market.Count));
-                    var currency = Market[symbol];
-                    var change = random.Next(-30, 31);
-                    var newPrice = Math.Max(0.01m, currency.PriceHistory.LastOrDefault(currency.BaseValue) * (1 + change / 100m));
+                    if (Market.Count > 0)
+                    {
+                        var random = new Random();
+                        var symbol = Market.Keys.ElementAt(random.Next(Market.Count));
+                        var currency = Market[symbol];
+                        var change = random.Next(-30, 31);
+                        var newPrice = Math.Max(0.01m, currency.PriceHistory.LastOrDefault(currency.BaseValue) * (1 + change / 100m));
 
-                    currency.PriceHistory.Add(newPrice);
-                    AdjustTreasuryOrders(currency, newPrice);
+                        currency.PriceHistory.Add(newPrice);
+                        AdjustTreasuryOrders(currency, newPrice);
 
-                    string eventMsg = $"🎲 رویداد تصادفی بازار!\nارز {symbol} با تغییر {change:+0;-0}% مواجه شد!\n💵 قیمت جدید: {FmtPrice(newPrice)}";
+                        eventMsg = $"🎲 رویداد تصادفی بازار!\nارز {symbol} با تغییر {change:+0;-0}% مواجه شد!\n💵 قیمت جدید: {FmtPrice(newPrice)}";
+                    }
+                    uids = Users.Keys.Where(id => id != 0).ToList();
+                }
+
+                if (!string.IsNullOrEmpty(eventMsg))
+                {
                     await bot.SendMessage(chatId, eventMsg, replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
-
-                    foreach (var uid in Users.Keys.Where(id => id != 0))
+                    foreach (var uid in uids)
                     {
                         try { await bot.SendMessage(uid, eventMsg); } catch { }
                     }
@@ -1130,32 +1233,41 @@ namespace StockBotApp
             }
             else if (new[] { "خبر مثبت", "خبر منفی", "هک", "جنگ", "رکود", "رشد ناگهانی", "سقوط آزاد", "بازگشت" }.Contains(text))
             {
-                if (Market.Count > 0)
+                string eventMsg = "";
+                List<long> uids;
+                lock (_dataLock)
                 {
-                    var random = new Random();
-                    var symbol = Market.Keys.ElementAt(random.Next(Market.Count));
-                    var currency = Market[symbol];
-                    decimal change = text switch
+                    if (Market.Count > 0)
                     {
-                        "خبر مثبت" => 25m,
-                        "خبر منفی" => -20m,
-                        "هک" => -40m,
-                        "جنگ" => -35m,
-                        "رکود" => -15m,
-                        "رشد ناگهانی" => 50m,
-                        "سقوط آزاد" => -60m,
-                        "بازگشت" => 30m,
-                        _ => 0m
-                    };
+                        var random = new Random();
+                        var symbol = Market.Keys.ElementAt(random.Next(Market.Count));
+                        var currency = Market[symbol];
+                        decimal change = text switch
+                        {
+                            "خبر مثبت" => 25m,
+                            "خبر منفی" => -20m,
+                            "هک" => -40m,
+                            "جنگ" => -35m,
+                            "رکود" => -15m,
+                            "رشد ناگهانی" => 50m,
+                            "سقوط آزاد" => -60m,
+                            "بازگشت" => 30m,
+                            _ => 0m
+                        };
 
-                    var newPrice = Math.Max(0.01m, currency.PriceHistory.LastOrDefault(currency.BaseValue) * (1 + change / 100m));
-                    currency.PriceHistory.Add(newPrice);
-                    AdjustTreasuryOrders(currency, newPrice);
+                        var newPrice = Math.Max(0.01m, currency.PriceHistory.LastOrDefault(currency.BaseValue) * (1 + change / 100m));
+                        currency.PriceHistory.Add(newPrice);
+                        AdjustTreasuryOrders(currency, newPrice);
 
-                    string eventMsg = $"📰 رویداد ویژه بازار: {text}\nارز {symbol} با تغییر {change:+0;-0}% مواجه شد!\n💵 قیمت جدید: {FmtPrice(newPrice)}";
+                        eventMsg = $"📰 رویداد ویژه بازار: {text}\nارز {symbol} با تغییر {change:+0;-0}% مواجه شد!\n💵 قیمت جدید: {FmtPrice(newPrice)}";
+                    }
+                    uids = Users.Keys.Where(id => id != 0).ToList();
+                }
+
+                if (!string.IsNullOrEmpty(eventMsg))
+                {
                     await bot.SendMessage(chatId, eventMsg, replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
-
-                    foreach (var uid in Users.Keys.Where(id => id != 0))
+                    foreach (var uid in uids)
                     {
                         try { await bot.SendMessage(uid, eventMsg); } catch { }
                     }
@@ -1176,10 +1288,15 @@ namespace StockBotApp
         {
             var chatId = message.Chat.Id;
             var userId = message.From?.Id ?? chatId;
-            if (!Users.TryGetValue(userId, out var user) || user == null)
+            User user;
+            lock (_dataLock)
             {
-                user = new User { UserId = userId, Username = "unknown", Balance = 5000m };
-                Users[userId] = user;
+                if (!Users.TryGetValue(userId, out var u) || u == null)
+                {
+                    u = new User { UserId = userId, Username = "unknown", Balance = 5000m };
+                    Users[userId] = u;
+                }
+                user = u;
             }
 
             // مدیریت /start و کدهای رفرال
@@ -1188,13 +1305,21 @@ namespace StockBotApp
                 if (text.StartsWith("/start "))
                 {
                     var code = text.Split(' ')[1].Trim();
-                    var referrer = Users.Values.FirstOrDefault(u => u.ReferralCode.Equals(code, StringComparison.OrdinalIgnoreCase));
-                    if (referrer != null && referrer.UserId != userId && user.Referrals == 0 && user.TotalTrades == 0)
+                    long targetReferrerId = 0;
+                    lock (_dataLock)
                     {
-                        referrer.Balance += 500m;
-                        referrer.Referrals++;
-                        user.Balance += 200m;
-                        try { await bot.SendMessage(referrer.UserId, $"🎉 تبریک! یک کاربر جدید با کد دعوت شما عضو شد! +$500 پاداش به موجودی شما اضافه شد."); } catch { }
+                        var referrer = Users.Values.FirstOrDefault(u => u.ReferralCode.Equals(code, StringComparison.OrdinalIgnoreCase));
+                        if (referrer != null && referrer.UserId != userId && user.Referrals == 0 && user.TotalTrades == 0)
+                        {
+                            referrer.Balance += 500m;
+                            referrer.Referrals++;
+                            user.Balance += 200m;
+                            targetReferrerId = referrer.UserId;
+                        }
+                    }
+                    if (targetReferrerId != 0)
+                    {
+                        try { await bot.SendMessage(targetReferrerId, $"🎉 تبریک! یک کاربر جدید با کد دعوت شما عضو شد! +$500 پاداش به موجودی شما اضافه شد."); } catch { }
                     }
                 }
 
@@ -1259,13 +1384,16 @@ namespace StockBotApp
                            $"📦 سهام‌های خریداری‌شده:\n";
 
                 bool hasStock = false;
-                foreach (var h in user.Portfolio.Where(x => x.Value > 0))
+                lock (_dataLock)
                 {
-                    hasStock = true;
-                    decimal curPrice = GetCurrentPrice(h.Key);
-                    decimal val = curPrice * h.Value;
-                    totalStockVal += val;
-                    p += $"🔸 {h.Key}: {h.Value:N0} واحد (ارزش: {FmtMoney(val)} | قیمت واحد: {FmtPrice(curPrice)})\n";
+                    foreach (var h in user.Portfolio.Where(x => x.Value > 0))
+                    {
+                        hasStock = true;
+                        decimal curPrice = GetCurrentPrice(h.Key);
+                        decimal val = curPrice * h.Value;
+                        totalStockVal += val;
+                        p += $"🔸 {h.Key}: {h.Value:N0} واحد (ارزش: {FmtMoney(val)} | قیمت واحد: {FmtPrice(curPrice)})\n";
+                    }
                 }
 
                 if (!hasStock)
@@ -1319,10 +1447,17 @@ namespace StockBotApp
                 if (parts.Length >= 2)
                 {
                     var symbol = parts[1].ToUpper();
-                    if (Market.TryGetValue(symbol, out var c))
+                    string chart = "";
+                    lock (_dataLock)
                     {
-                        string chart = $"📉 تاریخچه قیمت‌های {symbol} (۱۰ قیمت اخیر - $):\n";
-                        chart += string.Join(" → ", c.PriceHistory.TakeLast(10).Select(p => FmtPrice(p)));
+                        if (Market.TryGetValue(symbol, out var c))
+                        {
+                            chart = $"📉 تاریخچه قیمت‌های {symbol} (۱۰ قیمت اخیر - $):\n" +
+                                    string.Join(" → ", c.PriceHistory.TakeLast(10).Select(p => FmtPrice(p)));
+                        }
+                    }
+                    if (!string.IsNullOrEmpty(chart))
+                    {
                         await bot.SendMessage(chatId, chart, replyMarkup: GetUserKeyboard(userId), cancellationToken: ct);
                         return;
                     }
@@ -1354,18 +1489,30 @@ namespace StockBotApp
                 if (parts.Length == 4 && long.TryParse(parts[2], out var qty) && decimal.TryParse(parts[3], out var price))
                 {
                     var symbol = parts[1].ToUpper();
-                    if (Market.TryGetValue(symbol, out var c))
+                    bool success = false;
+                    decimal bal = 0m;
+                    lock (_dataLock)
                     {
-                        if (user.Balance < price * qty)
+                        if (Market.TryGetValue(symbol, out var c))
                         {
-                            await bot.SendMessage(chatId, $"❌ موجودی نقدی دلار شما کافی نیست.\nمبلغ مورد نیاز: {FmtMoney(price * qty)}\nموجودی شما: {FmtMoney(user.Balance)}", cancellationToken: ct);
-                            return;
+                            if (user.Balance >= price * qty)
+                            {
+                                var order = new Order { UserId = userId, Type = "BUY", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
+                                c.Orders.Add(order);
+                                MatchOrders(symbol, userId);
+                                bal = Users[userId].Balance;
+                                success = true;
+                            }
                         }
-
-                        var order = new Order { UserId = userId, Type = "BUY", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
-                        c.Orders.Add(order);
-                        MatchOrders(symbol, userId);
-                        await bot.SendMessage(chatId, $"✅ سفارش خرید {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} ثبت و بررسی شد!\n💰 موجودی دلار: {FmtMoney(Users[userId].Balance)}", replyMarkup: GetUserKeyboard(userId), cancellationToken: ct);
+                    }
+                    if (success)
+                    {
+                        await bot.SendMessage(chatId, $"✅ سفارش خرید {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} ثبت و بررسی شد!\n💰 موجودی دلار: {FmtMoney(bal)}", replyMarkup: GetUserKeyboard(userId), cancellationToken: ct);
+                        return;
+                    }
+                    else
+                    {
+                        await bot.SendMessage(chatId, $"❌ موجودی نقدی دلار شما کافی نیست.\nمبلغ مورد نیاز: {FmtMoney(price * qty)}\nموجودی شما: {FmtMoney(user.Balance)}", cancellationToken: ct);
                         return;
                     }
                 }
@@ -1376,19 +1523,32 @@ namespace StockBotApp
                 if (parts.Length == 4 && long.TryParse(parts[2], out var qty) && decimal.TryParse(parts[3], out var price))
                 {
                     var symbol = parts[1].ToUpper();
-                    if (Market.TryGetValue(symbol, out var c))
+                    bool success = false;
+                    long hasStock = 0;
+                    decimal bal = 0m;
+                    lock (_dataLock)
                     {
-                        var hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
-                        if (hasStock < qty)
+                        if (Market.TryGetValue(symbol, out var c))
                         {
-                            await bot.SendMessage(chatId, $"❌ موجودی سهام شما از ارز {symbol} کافی نیست. موجودی: {hasStock:N0} واحد", cancellationToken: ct);
-                            return;
+                            hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                            if (hasStock >= qty)
+                            {
+                                var order = new Order { UserId = userId, Type = "SELL", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
+                                c.Orders.Add(order);
+                                MatchOrders(symbol, userId);
+                                bal = Users[userId].Balance;
+                                success = true;
+                            }
                         }
-
-                        var order = new Order { UserId = userId, Type = "SELL", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
-                        c.Orders.Add(order);
-                        MatchOrders(symbol, userId);
-                        await bot.SendMessage(chatId, $"✅ سفارش فروش {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} ثبت و بررسی شد!\n💰 موجودی دلار: {FmtMoney(Users[userId].Balance)}", replyMarkup: GetUserKeyboard(userId), cancellationToken: ct);
+                    }
+                    if (success)
+                    {
+                        await bot.SendMessage(chatId, $"✅ سفارش فروش {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} ثبت و بررسی شد!\n💰 موجودی دلار: {FmtMoney(bal)}", replyMarkup: GetUserKeyboard(userId), cancellationToken: ct);
+                        return;
+                    }
+                    else
+                    {
+                        await bot.SendMessage(chatId, $"❌ موجودی سهام شما از ارز {symbol} کافی نیست. موجودی: {hasStock:N0} واحد", cancellationToken: ct);
                         return;
                     }
                 }
@@ -1399,16 +1559,24 @@ namespace StockBotApp
                 if (parts.Length >= 2)
                 {
                     var code = parts[1].Trim();
-                    var referrer = Users.Values.FirstOrDefault(u => u.ReferralCode.Equals(code, StringComparison.OrdinalIgnoreCase));
-                    if (referrer != null && referrer.UserId != userId && user.Referrals == 0 && user.TotalTrades == 0)
+                    long targetReferrerId = 0;
+                    lock (_dataLock)
                     {
-                        referrer.Balance += 500m;
-                        referrer.Referrals++;
-                        user.Balance += 200m;
+                        var referrer = Users.Values.FirstOrDefault(u => u.ReferralCode.Equals(code, StringComparison.OrdinalIgnoreCase));
+                        if (referrer != null && referrer.UserId != userId && user.Referrals == 0 && user.TotalTrades == 0)
+                        {
+                            referrer.Balance += 500m;
+                            referrer.Referrals++;
+                            user.Balance += 200m;
+                            targetReferrerId = referrer.UserId;
+                        }
+                    }
+                    if (targetReferrerId != 0)
+                    {
                         await bot.SendMessage(chatId, $"✅ با موفقیت با کد دعوت ثبت شدید! مبلغ {FmtMoney(200m)} به موجودی شما اضافه شد.", replyMarkup: GetUserKeyboard(userId), cancellationToken: ct);
                         try
                         {
-                            await bot.SendMessage(referrer.UserId, $"🎉 یکی از دوستان شما با کد دعوتتان عضو شد! پاداش {FmtMoney(500m)} واریز شد.");
+                            await bot.SendMessage(targetReferrerId, $"🎉 یکی از دوستان شما با کد دعوتتان عضو شد! پاداش {FmtMoney(500m)} واریز شد.");
                         }
                         catch { }
                         return;
@@ -1443,19 +1611,24 @@ namespace StockBotApp
             var userId = callbackQuery.From.Id;
             long chatId = callbackQuery.Message?.Chat.Id ?? userId;
 
-            if (!Users.TryGetValue(userId, out var user) || user == null)
+            User user;
+            lock (_dataLock)
             {
-                user = new User
+                if (!Users.TryGetValue(userId, out var u) || u == null)
                 {
-                    UserId = userId,
-                    Username = callbackQuery.From.Username ?? "unknown",
-                    Balance = 5000m,
-                    Level = 1,
-                    XP = 0
-                };
-                user.DeviceFingerprints.Add(userId % 100000);
-                user.ReferralCode = "REF" + userId.ToString().Substring(Math.Max(0, userId.ToString().Length - 6));
-                Users[userId] = user;
+                    u = new User
+                    {
+                        UserId = userId,
+                        Username = callbackQuery.From.Username ?? "unknown",
+                        Balance = 5000m,
+                        Level = 1,
+                        XP = 0
+                    };
+                    u.DeviceFingerprints.Add(userId % 100000);
+                    u.ReferralCode = "REF" + userId.ToString().Substring(Math.Max(0, userId.ToString().Length - 6));
+                    Users[userId] = u;
+                }
+                user = u;
             }
 
             if (data.StartsWith("VIEW_SYMBOL_"))
@@ -1471,82 +1644,89 @@ namespace StockBotApp
             else if (data.StartsWith("BUY_MENU_"))
             {
                 var symbol = data.Split('_')[2];
-                if (Market.TryGetValue(symbol, out var c))
+                decimal price;
+                lock (_dataLock)
                 {
-                    var price = GetCurrentPrice(symbol);
-                    string msg = $"🛒 خرید سریع سهام {symbol} — قیمت لحظه‌ای واحد: {FmtPrice(price)}\n\n" +
-                                 $"💵 موجودی دلار نقدی شما: {FmtMoney(user.Balance)}\n" +
-                                 $"لطفاً مقدار مورد نظر برای خرید فوری در قیمت بازار را انتخاب کنید:";
-
-                    var kb = new InlineKeyboardMarkup(new[]
-                    {
-                        new[]
-                        {
-                            InlineKeyboardButton.WithCallbackData("🛒 ۱ واحد", $"QUICK_BUY_{symbol}_1"),
-                            InlineKeyboardButton.WithCallbackData("🛒 ۳ واحد", $"QUICK_BUY_{symbol}_3"),
-                            InlineKeyboardButton.WithCallbackData("🛒 ۵ واحد", $"QUICK_BUY_{symbol}_5")
-                        },
-                        new[]
-                        {
-                            InlineKeyboardButton.WithCallbackData("🛒 ۱۰ واحد", $"QUICK_BUY_{symbol}_10"),
-                            InlineKeyboardButton.WithCallbackData("🛒 ۲۵ واحد", $"QUICK_BUY_{symbol}_25"),
-                            InlineKeyboardButton.WithCallbackData("🛒 ۵۰ واحد", $"QUICK_BUY_{symbol}_50")
-                        },
-                        new[]
-                        {
-                            InlineKeyboardButton.WithCallbackData("✍️ خرید مقدار دلخواه", $"CUSTOM_BUY_INPUT_{symbol}"),
-                            InlineKeyboardButton.WithCallbackData("🔙 بازگشت", $"VIEW_SYMBOL_{symbol}")
-                        }
-                    });
-
-                    await bot.SendMessage(chatId, msg, replyMarkup: kb, cancellationToken: ct);
+                    if (!Market.TryGetValue(symbol, out _)) return;
+                    price = GetCurrentPrice(symbol);
                 }
+
+                string msg = $"🛒 خرید سریع سهام {symbol} — قیمت لحظه‌ای واحد: {FmtPrice(price)}\n\n" +
+                             $"💵 موجودی دلار نقدی شما: {FmtMoney(user.Balance)}\n" +
+                             $"لطفاً مقدار مورد نظر برای خرید فوری در قیمت بازار را انتخاب کنید:";
+
+                var kb = new InlineKeyboardMarkup(new[]
+                {
+                    new[]
+                    {
+                        InlineKeyboardButton.WithCallbackData("🛒 ۱ واحد", $"QUICK_BUY_{symbol}_1"),
+                        InlineKeyboardButton.WithCallbackData("🛒 ۳ واحد", $"QUICK_BUY_{symbol}_3"),
+                        InlineKeyboardButton.WithCallbackData("🛒 ۵ واحد", $"QUICK_BUY_{symbol}_5")
+                    },
+                    new[]
+                    {
+                        InlineKeyboardButton.WithCallbackData("🛒 ۱۰ واحد", $"QUICK_BUY_{symbol}_10"),
+                        InlineKeyboardButton.WithCallbackData("🛒 ۲۵ واحد", $"QUICK_BUY_{symbol}_25"),
+                        InlineKeyboardButton.WithCallbackData("🛒 ۵۰ واحد", $"QUICK_BUY_{symbol}_50")
+                    },
+                    new[]
+                    {
+                        InlineKeyboardButton.WithCallbackData("✍️ خرید مقدار دلخواه", $"CUSTOM_BUY_INPUT_{symbol}"),
+                        InlineKeyboardButton.WithCallbackData("🔙 بازگشت", $"VIEW_SYMBOL_{symbol}")
+                    }
+                });
+
+                await bot.SendMessage(chatId, msg, replyMarkup: kb, cancellationToken: ct);
             }
             else if (data.StartsWith("SELL_MENU_"))
             {
                 var symbol = data.Split('_')[2];
-                if (Market.TryGetValue(symbol, out var c))
+                long hasStock = 0;
+                decimal price = 0m;
+                lock (_dataLock)
                 {
-                    var hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
-                    var price = Math.Max(0.01m, GetCurrentPrice(symbol) * 0.95m); // قیمت نقدشوندگی فوری (۵٪ زیر قیمت بازار)
-
-                    string msg = $"💰 فروش سریع سهام {symbol} — قیمت نقدشوندگی واحد: {FmtPrice(price)}\n\n" +
-                                 $"📦 موجودی سهام شما: {hasStock:N0} واحد\n" +
-                                 $"لطفاً مقدار مورد نظر برای فروش فوری را انتخاب کنید:";
-
-                    var kb = new InlineKeyboardMarkup(new[]
-                    {
-                        new[]
-                        {
-                            InlineKeyboardButton.WithCallbackData("💰 ۱ واحد", $"QUICK_SELL_{symbol}_1"),
-                            InlineKeyboardButton.WithCallbackData("💰 ۳ واحد", $"QUICK_SELL_{symbol}_3"),
-                            InlineKeyboardButton.WithCallbackData("💰 ۵ واحد", $"QUICK_SELL_{symbol}_5")
-                        },
-                        new[]
-                        {
-                            InlineKeyboardButton.WithCallbackData("💰 ۱۰ واحد", $"QUICK_SELL_{symbol}_10"),
-                            InlineKeyboardButton.WithCallbackData("💰 ۲۵ واحد", $"QUICK_SELL_{symbol}_25"),
-                            InlineKeyboardButton.WithCallbackData("💰 ۵۰ واحد", $"QUICK_SELL_{symbol}_50")
-                        },
-                        new[]
-                        {
-                            InlineKeyboardButton.WithCallbackData("🔥 فروش همه موجودی", $"SELL_ALL_{symbol}"),
-                            InlineKeyboardButton.WithCallbackData("✍️ فروش مقدار دلخواه", $"CUSTOM_SELL_INPUT_{symbol}")
-                        },
-                        new[]
-                        {
-                            InlineKeyboardButton.WithCallbackData("🔙 بازگشت به پنل ارز", $"VIEW_SYMBOL_{symbol}")
-                        }
-                    });
-
-                    await bot.SendMessage(chatId, msg, replyMarkup: kb, cancellationToken: ct);
+                    if (!Market.TryGetValue(symbol, out _)) return;
+                    hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                    price = Math.Max(0.01m, GetCurrentPrice(symbol) * 0.95m);
                 }
+
+                string msg = $"💰 فروش سریع سهام {symbol} — قیمت نقدشوندگی واحد: {FmtPrice(price)}\n\n" +
+                             $"📦 موجودی سهام شما: {hasStock:N0} واحد\n" +
+                             $"لطفاً مقدار مورد نظر برای فروش فوری را انتخاب کنید:";
+
+                var kb = new InlineKeyboardMarkup(new[]
+                {
+                    new[]
+                    {
+                        InlineKeyboardButton.WithCallbackData("💰 ۱ واحد", $"QUICK_SELL_{symbol}_1"),
+                        InlineKeyboardButton.WithCallbackData("💰 ۳ واحد", $"QUICK_SELL_{symbol}_3"),
+                        InlineKeyboardButton.WithCallbackData("💰 ۵ واحد", $"QUICK_SELL_{symbol}_5")
+                    },
+                    new[]
+                    {
+                        InlineKeyboardButton.WithCallbackData("💰 ۱۰ واحد", $"QUICK_SELL_{symbol}_10"),
+                        InlineKeyboardButton.WithCallbackData("💰 ۲۵ واحد", $"QUICK_SELL_{symbol}_25"),
+                        InlineKeyboardButton.WithCallbackData("💰 ۵۰ واحد", $"QUICK_SELL_{symbol}_50")
+                    },
+                    new[]
+                    {
+                        InlineKeyboardButton.WithCallbackData("🔥 فروش همه موجودی", $"SELL_ALL_{symbol}"),
+                        InlineKeyboardButton.WithCallbackData("✍️ فروش مقدار دلخواه", $"CUSTOM_SELL_INPUT_{symbol}")
+                    },
+                    new[]
+                    {
+                        InlineKeyboardButton.WithCallbackData("🔙 بازگشت به پنل ارز", $"VIEW_SYMBOL_{symbol}")
+                    }
+                });
+
+                await bot.SendMessage(chatId, msg, replyMarkup: kb, cancellationToken: ct);
             }
             else if (data.StartsWith("CUSTOM_BUY_INPUT_"))
             {
                 var symbol = data.Split('_')[3];
                 UserStates[chatId] = $"CUSTOM_BUY_QTY_{symbol}";
-                var price = GetCurrentPrice(symbol);
+                decimal price;
+                lock (_dataLock) { price = GetCurrentPrice(symbol); }
                 await bot.SendMessage(
                     chatId,
                     $"🛒 لطفاً تعداد واحد مورد نظر برای خرید فوری {symbol} به قیمت لحظه‌ای واحد ({FmtPrice(price)}) را به صورت یک عدد وارد کنید (مثال: 3 یا 15):",
@@ -1557,7 +1737,8 @@ namespace StockBotApp
             {
                 var symbol = data.Split('_')[3];
                 UserStates[chatId] = $"CUSTOM_SELL_QTY_{symbol}";
-                var hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                long hasStock;
+                lock (_dataLock) { hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0; }
                 await bot.SendMessage(
                     chatId,
                     $"💰 لطفاً تعداد واحد مورد نظر برای فروش فوری {symbol} را وارد کنید (موجودی سهام شما: {hasStock:N0} واحد):",
@@ -1568,22 +1749,34 @@ namespace StockBotApp
             {
                 var parts = data.Split('_');
                 var symbol = parts[2];
-                if (long.TryParse(parts[3], out var qty) && Market.TryGetValue(symbol, out var c))
+                if (long.TryParse(parts[3], out var qty))
                 {
-                    var price = GetCurrentPrice(symbol);
-                    decimal totalCost = price * qty * 1.01m; // ۱٪ کارمزد
+                    bool canBuy = false;
+                    decimal price = 0m;
+                    decimal totalCost = 0m;
+                    lock (_dataLock)
+                    {
+                        if (Market.TryGetValue(symbol, out var c))
+                        {
+                            price = GetCurrentPrice(symbol);
+                            totalCost = price * qty * 1.01m;
+                            if (user.Balance >= totalCost)
+                            {
+                                canBuy = true;
+                                var order = new Order { UserId = userId, Type = "BUY", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
+                                c.Orders.Add(order);
+                                MatchOrders(symbol, userId);
+                            }
+                        }
+                    }
 
-                    if (user.Balance < totalCost)
+                    if (!canBuy)
                     {
                         await bot.SendMessage(chatId, $"❌ موجودی نقدی دلار شما کافی نیست.\nمبلغ مورد نیاز با کارمزد: {FmtMoney(totalCost)}\nموجودی شما: {FmtMoney(user.Balance)}", cancellationToken: ct);
                         return;
                     }
 
-                    var order = new Order { UserId = userId, Type = "BUY", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
-                    c.Orders.Add(order);
-                    MatchOrders(symbol, userId);
                     RequestSave();
-
                     await bot.SendMessage(
                         chatId,
                         $"✅ سفارش فوری خرید {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} ثبت و معامله شد!\n💰 موجودی جدید دلار شما: {FmtMoney(user.Balance)}",
@@ -1596,21 +1789,34 @@ namespace StockBotApp
             {
                 var parts = data.Split('_');
                 var symbol = parts[2];
-                if (long.TryParse(parts[3], out var qty) && Market.TryGetValue(symbol, out var c))
+                if (long.TryParse(parts[3], out var qty))
                 {
-                    var hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
-                    if (hasStock < qty)
+                    bool canSell = false;
+                    long hasStock = 0;
+                    decimal price = 0m;
+                    lock (_dataLock)
+                    {
+                        if (Market.TryGetValue(symbol, out var c))
+                        {
+                            hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                            if (hasStock >= qty)
+                            {
+                                canSell = true;
+                                price = Math.Max(0.01m, GetCurrentPrice(symbol) * 0.95m);
+                                var order = new Order { UserId = userId, Type = "SELL", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
+                                c.Orders.Add(order);
+                                MatchOrders(symbol, userId);
+                            }
+                        }
+                    }
+
+                    if (!canSell)
                     {
                         await bot.SendMessage(chatId, $"❌ موجودی سهام {symbol} شما کافی نیست. موجودی شما: {hasStock:N0} واحد", cancellationToken: ct);
                         return;
                     }
 
-                    var price = Math.Max(0.01m, GetCurrentPrice(symbol) * 0.95m);
-                    var order = new Order { UserId = userId, Type = "SELL", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
-                    c.Orders.Add(order);
-                    MatchOrders(symbol, userId);
                     RequestSave();
-
                     await bot.SendMessage(
                         chatId,
                         $"✅ سفارش فوری فروش {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} معامله شد!\n💰 موجودی جدید دلار شما: {FmtMoney(user.Balance)}",
@@ -1622,28 +1828,38 @@ namespace StockBotApp
             else if (data.StartsWith("SELL_ALL_"))
             {
                 var symbol = data.Split('_')[2];
-                if (Market.TryGetValue(symbol, out var c))
+                bool canSell = false;
+                long hasStock = 0;
+                decimal price = 0m;
+                lock (_dataLock)
                 {
-                    var hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
-                    if (hasStock <= 0)
+                    if (Market.TryGetValue(symbol, out var c))
                     {
-                        await bot.SendMessage(chatId, $"❌ شما هیچ موجودی از ارز {symbol} برای فروش ندارید.", cancellationToken: ct);
-                        return;
+                        hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                        if (hasStock > 0)
+                        {
+                            canSell = true;
+                            price = Math.Max(0.01m, GetCurrentPrice(symbol) * 0.95m);
+                            var order = new Order { UserId = userId, Type = "SELL", Price = price, Quantity = hasStock, Timestamp = DateTime.UtcNow };
+                            c.Orders.Add(order);
+                            MatchOrders(symbol, userId);
+                        }
                     }
-
-                    var price = Math.Max(0.01m, GetCurrentPrice(symbol) * 0.95m);
-                    var order = new Order { UserId = userId, Type = "SELL", Price = price, Quantity = hasStock, Timestamp = DateTime.UtcNow };
-                    c.Orders.Add(order);
-                    MatchOrders(symbol, userId);
-                    RequestSave();
-
-                    await bot.SendMessage(
-                        chatId,
-                        $"✅ تمام موجودی {symbol} شما ({hasStock:N0} واحد) به قیمت واحد {FmtPrice(price)} فروخته شد!\n💰 موجودی جدید دلار شما: {FmtMoney(user.Balance)}",
-                        replyMarkup: userId == OwnerId ? GetOwnerKeyboard() : GetUserKeyboard(userId),
-                        cancellationToken: ct
-                    );
                 }
+
+                if (!canSell)
+                {
+                    await bot.SendMessage(chatId, $"❌ شما هیچ موجودی از ارز {symbol} برای فروش ندارید.", cancellationToken: ct);
+                    return;
+                }
+
+                RequestSave();
+                await bot.SendMessage(
+                    chatId,
+                    $"✅ تمام موجودی {symbol} شما ({hasStock:N0} واحد) به قیمت واحد {FmtPrice(price)} فروخته شد!\n💰 موجودی جدید دلار شما: {FmtMoney(user.Balance)}",
+                    replyMarkup: userId == OwnerId ? GetOwnerKeyboard() : GetUserKeyboard(userId),
+                    cancellationToken: ct
+                );
             }
             else if (data == "SHOW_REFERRAL")
             {
@@ -1659,22 +1875,39 @@ namespace StockBotApp
         // ===================== HELPER METHODS & UI CARDS =====================
         private static async Task SendSymbolCardAsync(ITelegramBotClient bot, long chatId, string symbol, CancellationToken ct)
         {
-            if (!Market.TryGetValue(symbol, out var c))
+            Currency? cCopy = null;
+            decimal currentPrice = 0m;
+            int openSells = 0;
+            int openBuys = 0;
+
+            lock (_dataLock)
+            {
+                if (!Market.TryGetValue(symbol, out var c))
+                {
+                    cCopy = null;
+                }
+                else
+                {
+                    cCopy = c;
+                    currentPrice = GetCurrentPrice(symbol);
+                    openSells = c.Orders.Count(o => o.Type == "SELL");
+                    openBuys = c.Orders.Count(o => o.Type == "BUY");
+                }
+            }
+
+            if (cCopy == null)
             {
                 await bot.SendMessage(chatId, $"❌ ارز {symbol} یافت نشد.", cancellationToken: ct);
                 return;
             }
 
-            decimal currentPrice = GetCurrentPrice(symbol);
-            decimal baseVal = c.BaseValue;
+            decimal baseVal = cCopy.BaseValue;
             decimal changePct = baseVal > 0 ? ((currentPrice - baseVal) / baseVal) * 100m : 0m;
-            int openSells = c.Orders.Count(o => o.Type == "SELL");
-            int openBuys = c.Orders.Count(o => o.Type == "BUY");
 
-            string caption = $"🏷 ارز: {c.Symbol} — {c.Description}\n\n" +
+            string caption = $"🏷 ارز: {cCopy.Symbol} — {cCopy.Description}\n\n" +
                              $"💵 قیمت لحظه‌ای: {FmtPrice(currentPrice)} ({(changePct >= 0 ? "+" : "")}{changePct:N1}% نسبت به قیمت پایه)\n" +
                              $"💎 قیمت پایه: {FmtPrice(baseVal)}\n" +
-                             $"📦 عرضه در گردش: {c.CirculatingSupply:N0} از {c.TotalSupply:N0} واحد\n" +
+                             $"📦 عرضه در گردش: {cCopy.CirculatingSupply:N0} از {cCopy.TotalSupply:N0} واحد\n" +
                              $"📋 سفارشات فعال بازار: {openSells} فروش | {openBuys} خرید\n\n" +
                              $"💡 برای خرید، فروش فوری یا مشاهده نمودار، روی دکمه‌های زیر کلیک کنید:";
 
@@ -1693,13 +1926,13 @@ namespace StockBotApp
             });
 
             bool photoSent = false;
-            if (!string.IsNullOrWhiteSpace(c.PhotoUrl))
+            if (!string.IsNullOrWhiteSpace(cCopy.PhotoUrl))
             {
                 try
                 {
                     await bot.SendPhoto(
                         chatId,
-                        InputFile.FromString(c.PhotoUrl),
+                        InputFile.FromString(cCopy.PhotoUrl),
                         caption: caption,
                         replyMarkup: inlineKb,
                         cancellationToken: ct
@@ -1726,18 +1959,22 @@ namespace StockBotApp
         private static async Task SendMarketOverviewAsync(ITelegramBotClient bot, long chatId, CancellationToken ct)
         {
             string msg = "📊 بازار لحظه‌ای ارزها و سهام:\n\n";
-            foreach (var c in Market.Values)
+            List<InlineKeyboardButton> symbolButtons;
+            lock (_dataLock)
             {
-                decimal price = GetCurrentPrice(c.Symbol);
-                decimal changePct = c.BaseValue > 0 ? ((price - c.BaseValue) / c.BaseValue) * 100m : 0m;
-                string arrow = changePct >= 0 ? "🟢" : "🔴";
-                msg += $"{arrow} {c.Symbol} | قیمت: {FmtPrice(price)} ({(changePct >= 0 ? "+" : "")}{changePct:N1}%)\n";
+                foreach (var c in Market.Values)
+                {
+                    decimal price = GetCurrentPrice(c.Symbol);
+                    decimal changePct = c.BaseValue > 0 ? ((price - c.BaseValue) / c.BaseValue) * 100m : 0m;
+                    string arrow = changePct >= 0 ? "🟢" : "🔴";
+                    msg += $"{arrow} {c.Symbol} | قیمت: {FmtPrice(price)} ({(changePct >= 0 ? "+" : "")}{changePct:N1}%)\n";
+                }
+                symbolButtons = Market.Keys.Select(sym =>
+                    InlineKeyboardButton.WithCallbackData($"📊 {sym} ({FmtPrice(GetCurrentPrice(sym))})", $"VIEW_SYMBOL_{sym}")
+                ).ToList();
             }
-            msg += "\n💡 برای مشاهده کارت اختصاصی هر ارز، تصویر و معامله فوری، روی نماد مورد نظر کلیک کنید:";
 
-            var symbolButtons = Market.Keys.Select(sym =>
-                InlineKeyboardButton.WithCallbackData($"📊 {sym} ({FmtPrice(GetCurrentPrice(sym))})", $"VIEW_SYMBOL_{sym}")
-            ).ToList();
+            msg += "\n💡 برای مشاهده کارت اختصاصی هر ارز، تصویر و معامله فوری، روی نماد مورد نظر کلیک کنید:";
 
             var rows = new List<InlineKeyboardButton[]>();
             for (int i = 0; i < symbolButtons.Count; i += 2)
@@ -1757,9 +1994,13 @@ namespace StockBotApp
                          "ارز مورد نظر را از لیست زیر انتخاب کنید یا از دستور متنی زیر استفاده کنید:\n" +
                          "مثال: خرید BTC 10 65000";
 
-            var symbolButtons = Market.Keys.Select(sym =>
-                InlineKeyboardButton.WithCallbackData($"🛒 خرید {sym} ({FmtPrice(GetCurrentPrice(sym))})", $"BUY_MENU_{sym}")
-            ).ToList();
+            List<InlineKeyboardButton> symbolButtons;
+            lock (_dataLock)
+            {
+                symbolButtons = Market.Keys.Select(sym =>
+                    InlineKeyboardButton.WithCallbackData($"🛒 خرید {sym} ({FmtPrice(GetCurrentPrice(sym))})", $"BUY_MENU_{sym}")
+                ).ToList();
+            }
 
             var rows = new List<InlineKeyboardButton[]>();
             for (int i = 0; i < symbolButtons.Count; i += 2)
@@ -1779,9 +2020,13 @@ namespace StockBotApp
                          "ارز مورد نظر را از لیست زیر انتخاب کنید یا از دستور متنی زیر استفاده کنید:\n" +
                          "مثال: فروش BTC 5 65000";
 
-            var symbolButtons = Market.Keys.Select(sym =>
-                InlineKeyboardButton.WithCallbackData($"💰 فروش {sym}", $"SELL_MENU_{sym}")
-            ).ToList();
+            List<InlineKeyboardButton> symbolButtons;
+            lock (_dataLock)
+            {
+                symbolButtons = Market.Keys.Select(sym =>
+                    InlineKeyboardButton.WithCallbackData($"💰 فروش {sym}", $"SELL_MENU_{sym}")
+                ).ToList();
+            }
 
             var rows = new List<InlineKeyboardButton[]>();
             for (int i = 0; i < symbolButtons.Count; i += 2)
@@ -1800,9 +2045,13 @@ namespace StockBotApp
             string msg = "📈 منوی انتخاب چارت و نمودار گرافیکی روند قیمت:\n\n" +
                          "برای تولید چارت گرافیکی (ScottPlot)، روی نماد مورد نظر کلیک کنید:";
 
-            var symbolButtons = Market.Keys.Select(sym =>
-                InlineKeyboardButton.WithCallbackData($"📈 چارت {sym}", $"CHART_{sym}")
-            ).ToList();
+            List<InlineKeyboardButton> symbolButtons;
+            lock (_dataLock)
+            {
+                symbolButtons = Market.Keys.Select(sym =>
+                    InlineKeyboardButton.WithCallbackData($"📈 چارت {sym}", $"CHART_{sym}")
+                ).ToList();
+            }
 
             var rows = new List<InlineKeyboardButton[]>();
             for (int i = 0; i < symbolButtons.Count; i += 2)
@@ -1818,16 +2067,30 @@ namespace StockBotApp
 
         private static async Task SendGraphicChartAsync(ITelegramBotClient bot, long chatId, string symbol, CancellationToken ct)
         {
-            if (!Market.TryGetValue(symbol, out var c))
+            decimal[] prices;
+            decimal baseValue;
+            decimal curPrice;
+            lock (_dataLock)
+            {
+                if (!Market.TryGetValue(symbol, out var c))
+                {
+                    prices = Array.Empty<decimal>();
+                    baseValue = 1m;
+                    curPrice = 1m;
+                }
+                else
+                {
+                    prices = c.PriceHistory.TakeLast(30).ToArray();
+                    if (prices.Length == 0) prices = new[] { c.BaseValue };
+                    baseValue = c.BaseValue;
+                    curPrice = GetCurrentPrice(symbol);
+                }
+            }
+
+            if (prices.Length == 0)
             {
                 await bot.SendMessage(chatId, $"❌ ارز {symbol} یافت نشد.", cancellationToken: ct);
                 return;
-            }
-
-            var prices = c.PriceHistory.TakeLast(30).ToArray();
-            if (prices.Length == 0)
-            {
-                prices = new[] { c.BaseValue };
             }
 
             try
@@ -1845,16 +2108,16 @@ namespace StockBotApp
                 plt.Axes.Left.Label.Text = "Price ($)";
 
                 string filePath = $"{symbol}_chart_{DateTime.UtcNow.Ticks}.png";
-                plt.SavePng(filePath, 800, 400);
+                await Task.Run(() => plt.SavePng(filePath, 800, 400), ct);
 
                 await using var stream = IOFile.OpenRead(filePath);
                 await bot.SendPhoto(
                     chatId,
                     InputFile.FromStream(stream, filePath),
-                    caption: $"📈 چارت گرافیکی روند قیمت {symbol}\n💵 قیمت فعلی: {FmtPrice(GetCurrentPrice(symbol))}\n💎 قیمت پایه: {FmtPrice(c.BaseValue)}",
+                    caption: $"📈 چارت گرافیکی روند قیمت {symbol}\n💵 قیمت فعلی: {FmtPrice(curPrice)}\n💎 قیمت پایه: {FmtPrice(baseValue)}",
                     cancellationToken: ct
                 );
-                IOFile.Delete(filePath);
+                try { IOFile.Delete(filePath); } catch { }
             }
             catch
             {
@@ -1864,17 +2127,25 @@ namespace StockBotApp
 
         private static async Task SendLeaderboardAsync(ITelegramBotClient bot, long chatId, long currentUserId, CancellationToken ct)
         {
-            var leaderboard = Users.Values
-                .Where(u => u.UserId != 0)
-                .OrderByDescending(u => u.Balance + u.Portfolio.Sum(p => p.Value * GetCurrentPrice(p.Key)))
-                .Take(10)
-                .ToList();
+            List<User> leaderboard;
+            lock (_dataLock)
+            {
+                leaderboard = Users.Values
+                    .Where(u => u.UserId != 0)
+                    .OrderByDescending(u => u.Balance + u.Portfolio.Sum(p => p.Value * GetCurrentPrice(p.Key)))
+                    .Take(10)
+                    .ToList();
+            }
 
             string lb = "🏆 لیدربورد ۱۰ معامله‌گر برتر بازار (ارزش کل حساب):\n\n";
             for (int i = 0; i < leaderboard.Count; i++)
             {
                 var u = leaderboard[i];
-                decimal net = u.Balance + u.Portfolio.Sum(p => p.Value * GetCurrentPrice(p.Key));
+                decimal net;
+                lock (_dataLock)
+                {
+                    net = u.Balance + u.Portfolio.Sum(p => p.Value * GetCurrentPrice(p.Key));
+                }
                 string rank = (i == 0) ? "🥇" : (i == 1) ? "🥈" : (i == 2) ? "🥉" : $"{i + 1}.";
                 lb += $"{rank} @{u.Username} — {FmtMoney(net)} (نقد: {FmtMoney(u.Balance)})\n";
             }
@@ -2074,17 +2345,20 @@ namespace StockBotApp
                     var tehran = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, TimeZoneInfo.FindSystemTimeZoneById("Iran Standard Time"));
                     if (tehran.Hour == 0 && tehran.Minute == 0)
                     {
-                        foreach (var user in Users.Values.Where(u => u.UserId != 0))
+                        lock (_dataLock)
                         {
-                            if (user.Balance < 5000m && (DateTime.UtcNow - user.LastDailyReward).TotalHours > 20)
+                            foreach (var user in Users.Values.Where(u => u.UserId != 0))
                             {
-                                user.Balance += 1000m;
-                                user.LastDailyReward = DateTime.UtcNow;
-                                try
+                                if (user.Balance < 5000m && (DateTime.UtcNow - user.LastDailyReward).TotalHours > 20)
                                 {
-                                    await Bot.SendMessage(user.UserId, $"🌙 پاداش شبانه: مبلغ {FmtMoney(1000m)} هدیه به حساب شما واریز شد!\n💰 موجودی جدید: {FmtMoney(user.Balance)}");
+                                    user.Balance += 1000m;
+                                    user.LastDailyReward = DateTime.UtcNow;
+                                    try
+                                    {
+                                        _ = Bot.SendMessage(user.UserId, $"🌙 پاداش شبانه: مبلغ {FmtMoney(1000m)} هدیه به حساب شما واریز شد!\n💰 موجودی جدید: {FmtMoney(user.Balance)}");
+                                    }
+                                    catch { }
                                 }
-                                catch { }
                             }
                         }
                         RequestSave();
