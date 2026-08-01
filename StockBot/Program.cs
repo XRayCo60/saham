@@ -1148,7 +1148,7 @@ namespace StockBotApp
                 if (long.TryParse(text, out var qty) && qty > 0)
                 {
                     UserStates[chatId] = $"LIMIT_BUY_PRICE_{symbol}_{qty}";
-                    await bot.SendMessage(chatId, $"💵 اکنون قیمت واحد دلخواه خود به دلار ($) را برای ورود به صف خرید {symbol} وارد کنید (مثال: 64500):", cancellationToken: ct);
+                    await bot.SendMessage(chatId, $"💵 قیمت پیشنهادی شما برای خرید هر ۱ واحد {symbol} چند دلار ($) است؟ (مثال: 80):", cancellationToken: ct);
                     return true;
                 }
                 else
@@ -1186,7 +1186,7 @@ namespace StockBotApp
                         var u = Users[message.From!.Id];
                         await bot.SendMessage(
                             chatId,
-                            $"✅ سفارش خرید {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} در تابلوی معاملاتی (صف خرید) ثبت شد!\nدر صورت حضور فروشنده معامله فوری انجام شده یا در صف باقی می‌ماند.",
+                            $"✅ سفارش خرید {qty:N0} واحد {symbol} به قیمت هر واحد {FmtPrice(price)} (ارزش کل: {FmtMoney(price * qty)}) ثبت شد!\nبه محض اینکه فروشنده‌ای در این قیمت پیدا شود، خرید شما به طور خودکار انجام خواهد شد.",
                             replyMarkup: u.UserId == OwnerId ? GetOwnerKeyboard() : GetUserKeyboard(u.UserId),
                             cancellationToken: ct
                         );
@@ -1210,7 +1210,7 @@ namespace StockBotApp
                 if (long.TryParse(text, out var qty) && qty > 0)
                 {
                     UserStates[chatId] = $"LIMIT_SELL_PRICE_{symbol}_{qty}";
-                    await bot.SendMessage(chatId, $"💵 اکنون قیمت واحد دلخواه خود به دلار ($) را برای ورود به صف فروش {symbol} وارد کنید (مثال: 65500):", cancellationToken: ct);
+                    await bot.SendMessage(chatId, $"💵 قیمت پیشنهادی شما برای فروش هر ۱ واحد {symbol} چند دلار ($) است؟ (مثال: 95):", cancellationToken: ct);
                     return true;
                 }
                 else
@@ -1249,7 +1249,7 @@ namespace StockBotApp
                         var u = Users[message.From!.Id];
                         await bot.SendMessage(
                             chatId,
-                            $"✅ سفارش فروش {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} در تابلوی معاملاتی (صف فروش) ثبت شد!\nدر صورت حضور خریدار معامله فوری انجام شده یا در صف باقی می‌ماند.",
+                            $"✅ سفارش فروش {qty:N0} واحد {symbol} به قیمت هر واحد {FmtPrice(price)} (ارزش کل: {FmtMoney(price * qty)}) ثبت شد!\nبه محض اینکه خریداری در این قیمت پیدا شود، سهام شما به طور خودکار فروخته می‌شود.",
                             replyMarkup: u.UserId == OwnerId ? GetOwnerKeyboard() : GetUserKeyboard(u.UserId),
                             cancellationToken: ct
                         );
