@@ -2311,18 +2311,18 @@ namespace StockBotApp
                 return;
             }
 
-            string msg = $"🏛 تابلوی معاملاتی لایو (بورس همتا به همتا)\n" +
-                         $"━━━ {cCopy.Symbol} — {cCopy.Description} ━━━\n\n" +
+            string msg = $"📋 تابلوی معاملات زنده — {cCopy.Symbol} ({cCopy.Description})\n\n" +
                          $"💵 آخرین قیمت معامله: {FmtPrice(curPrice)}\n" +
-                         $"💎 قیمت پایه (عرضه اولیه): {FmtPrice(cCopy.BaseValue)}\n" +
-                         $"🏦 سهام باقی‌مانده عرضه اولیه خزانه: {ipoLeft:N0} واحد\n\n" +
+                         $"💎 قیمت پایه اولیه: {FmtPrice(cCopy.BaseValue)}\n" +
+                         $"🏦 سهام باقی‌مانده خزانه: {ipoLeft:N0} واحد\n\n" +
                          $"━━━━━━━━━━━━━━━━━━━━━━\n" +
-                         $"🟢 صف خرید (Bids — تقاضا):\n" +
-                         $"┌ حجم ───── قیمت ───── خریدار\n";
+                         $"🛒 خریداران منتظر در صف (بهترین قیمت‌های خرید):\n" +
+                         $"تعداد واحد | قیمت پیشنهادی هر واحد\n" +
+                         $"------------------------------\n";
 
             if (buyOrders.Count == 0)
             {
-                msg += "└ (صف خرید خالی است)\n";
+                msg += "• (صف خرید خالی است)\n";
             }
             else
             {
@@ -2342,20 +2342,18 @@ namespace StockBotApp
                 for (int i = 0; i < groupedBuys.Count; i++)
                 {
                     var item = groupedBuys[i];
-                    string prefix = (i == groupedBuys.Count - 1) ? "└" : "├";
-                    string uName = (Users.TryGetValue(item.FirstUser, out var u) ? $"@{u.Username}" : $"{item.FirstUser}");
-                    if (item.Count > 1) uName += $" ({item.Count} سفارش)";
-                    msg += $"{prefix} {item.TotalQty:N0} واحد ─── {FmtPrice(item.Price)} ─── {uName}\n";
+                    msg += $"• {item.TotalQty:N0} واحد ─── هر واحد {FmtPrice(item.Price)}\n";
                 }
             }
 
             msg += $"━━━━━━━━━━━━━━━━━━━━━━\n" +
-                   $"🔴 صف فروش (Asks — عرضه):\n" +
-                   $"┌ حجم ───── قیمت ───── فروشنده\n";
+                   $"💰 فروشندگان منتظر در صف (بهترین قیمت‌های فروش):\n" +
+                   $"تعداد واحد | قیمت پیشنهادی هر واحد\n" +
+                   $"------------------------------\n";
 
             if (sellOrders.Count == 0)
             {
-                msg += "└ (صف فروش خالی است)\n";
+                msg += "• (صف فروش خالی است)\n";
             }
             else
             {
@@ -2375,27 +2373,28 @@ namespace StockBotApp
                 for (int i = 0; i < groupedSells.Count; i++)
                 {
                     var item = groupedSells[i];
-                    string prefix = (i == groupedSells.Count - 1) ? "└" : "├";
-                    string uName = item.FirstUser == 0 ? "🏦 خزانه (عرضه اولیه)" : (Users.TryGetValue(item.FirstUser, out var u) ? $"@{u.Username}" : $"{item.FirstUser}");
-                    if (item.Count > 1 && item.FirstUser != 0) uName += $" ({item.Count} سفارش)";
-                    msg += $"{prefix} {item.TotalQty:N0} واحد ─── {FmtPrice(item.Price)} ─── {uName}\n";
+                    string uLabel = item.FirstUser == 0 ? "  (خزانه مرکزی)" : "";
+                    msg += $"• {item.TotalQty:N0} واحد ─── هر واحد {FmtPrice(item.Price)}{uLabel}\n";
                 }
             }
 
             msg += $"━━━━━━━━━━━━━━━━━━━━━━\n" +
-                   $"💡 در بازار P2P، سفارش شما با کمترین قیمت فروشنده یا بیشترین قیمت خریدار معامله می‌شود؛ مگر اینکه در قیمت دلخواه سفارش بگذارید.";
+                   $"💡 راهنمای ساده تابلو:\n" +
+                   $"• خرید فوری ➔ سیستم خودکار از ارزان‌ترین فروشنده برایتان می‌خرد.\n" +
+                   $"• فروش فوری ➔ سیستم خودکار به بالاترین خریدار می‌فروشد.\n" +
+                   $"• اگر قیمت خاصی مدنظرتان است ➔ دکمه «سفارش در قیمت دلخواه» را بزنید تا سفارشتان وارد صف شود!";
 
             var kb = new InlineKeyboardMarkup(new[]
             {
                 new[]
                 {
-                    InlineKeyboardButton.WithCallbackData("🛒 ثبت سفارش خرید (Limit)", $"LIMIT_BUY_INPUT_{symbol}"),
-                    InlineKeyboardButton.WithCallbackData("💰 ثبت سفارش فروش (Limit)", $"LIMIT_SELL_INPUT_{symbol}")
+                    InlineKeyboardButton.WithCallbackData("🛒 سفارش خرید در قیمت دلخواه", $"LIMIT_BUY_INPUT_{symbol}"),
+                    InlineKeyboardButton.WithCallbackData("💰 سفارش فروش در قیمت دلخواه", $"LIMIT_SELL_INPUT_{symbol}")
                 },
                 new[]
                 {
-                    InlineKeyboardButton.WithCallbackData("🛒 خرید فوری از سرخط", $"BUY_MENU_{symbol}"),
-                    InlineKeyboardButton.WithCallbackData("💰 فروش فوری به سرخط", $"SELL_MENU_{symbol}")
+                    InlineKeyboardButton.WithCallbackData("🛒 خرید فوری (ارزان‌ترین فروشنده)", $"BUY_MENU_{symbol}"),
+                    InlineKeyboardButton.WithCallbackData("💰 فروش فوری (بالاترین خریدار)", $"SELL_MENU_{symbol}")
                 },
                 new[]
                 {
@@ -2404,7 +2403,7 @@ namespace StockBotApp
                 },
                 new[]
                 {
-                    InlineKeyboardButton.WithCallbackData("🔙 بازگشت به پنل ارز", $"VIEW_SYMBOL_{symbol}")
+                    InlineKeyboardButton.WithCallbackData("🔙 بازگشت به صفحه ارز", $"VIEW_SYMBOL_{symbol}")
                 }
             });
 
