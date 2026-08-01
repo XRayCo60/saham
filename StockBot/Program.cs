@@ -415,19 +415,29 @@ namespace StockBotApp
 
             LoadData();
 
-            // تنظیم SocketsHttpHandler پایدار با پینّگ‌های مداوم TCP Keep-Alive جهت جلوگیری از قطع شدن کانکشن در سرورهای لینوکس
-            var handler = new SocketsHttpHandler
+            HttpClient httpClient;
+            try
             {
-                PooledConnectionLifetime = TimeSpan.FromMinutes(15),
-                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
-                KeepAlivePingDelay = TimeSpan.FromSeconds(20),
-                KeepAlivePingTimeout = TimeSpan.FromSeconds(10),
-                EnableMultipleHttp2Connections = true
-            };
-            var httpClient = new HttpClient(handler)
+                var handler = new SocketsHttpHandler
+                {
+                    PooledConnectionLifetime = TimeSpan.FromMinutes(15),
+                    PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
+                    KeepAlivePingDelay = TimeSpan.FromSeconds(20),
+                    KeepAlivePingTimeout = TimeSpan.FromSeconds(10)
+                };
+                httpClient = new HttpClient(handler)
+                {
+                    Timeout = TimeSpan.FromSeconds(120)
+                };
+            }
+            catch (Exception ex)
             {
-                Timeout = TimeSpan.FromSeconds(120) // تایم‌اوت ۱۲۰ ثانیه برای جلوگیری از لغو درخواست‌های Long Polling تلگرام
-            };
+                Console.WriteLine($"[Naomi] SocketsHttpHandler fallback ({ex.Message}), using standard HttpClient.");
+                httpClient = new HttpClient()
+                {
+                    Timeout = TimeSpan.FromSeconds(120)
+                };
+            }
 
             Bot = new TelegramBotClient(Token, httpClient);
 
