@@ -2355,13 +2355,17 @@ namespace StockBotApp
                             // محاسبه قیمت پویا بر اساس عرضه و تقاضا (Dynamic AMM Price Impact)
                             decimal impactPct = Math.Max(0.0004m * matchQty, (decimal)matchQty / Math.Max(1000m, (decimal)currency.CirculatingSupply) * 0.12m);
                             decimal newTradePrice = tradePrice;
-                            if (buy.UserId == triggeredByUserId || sell.UserId == 0) // تقاضای خرید (کاربر خریدار است)
+                            if (buy.UserId != 0 && sell.UserId == 0) // تقاضای خرید از خزانه -> ۱۰۰٪ افزایش قیمت
                             {
                                 newTradePrice = Math.Max(0.01m, tradePrice * (1m + impactPct));
                             }
-                            else // فشار فروش (کاربر فروشنده است)
+                            else if (buy.UserId == 0 && sell.UserId != 0) // فشار فروش به خزانه -> ۱۰۰٪ کاهش قیمت
                             {
                                 newTradePrice = Math.Max(0.01m, tradePrice * (1m - (impactPct * 0.75m)));
+                            }
+                            else // معامله P2P بین دو کاربر واقعی
+                            {
+                                newTradePrice = tradePrice;
                             }
 
                             currency.PriceHistory.Add(newTradePrice);
