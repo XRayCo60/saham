@@ -79,17 +79,32 @@ namespace StockBotApp
         {
             LoadData();
             Bot = new TelegramBotClient(Token);
-            var me = await Bot.GetMe();
-            Console.WriteLine($"Bot started: @{me.Username}");
 
-            _ = Task.Run(DailyRewardScheduler);
-            _ = Task.Run(DatabaseBackupScheduler);
+            // حذف وب‌هوک قدیمی احتمالی برای اطمینان از عملکرد ۱۰۰٪ Polling
+            try { await Bot.DeleteWebhook(cancellationToken: CancellationToken.None); } catch { }
+
+            var me = await Bot.GetMe();
+            Console.WriteLine($"Bot started successfully: @{me.Username}");
+
+            var cts = new CancellationTokenSource();
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => {
+                SaveData();
+                cts.Cancel();
+            };
+            Console.CancelKeyPress += (s, e) => {
+                e.Cancel = true;
+                SaveData();
+                cts.Cancel();
+            };
+
+            _ = Task.Run(DailyRewardScheduler, cts.Token);
+            _ = Task.Run(DatabaseBackupScheduler, cts.Token);
 
             var receiverOptions = new ReceiverOptions { AllowedUpdates = Array.Empty<UpdateType>() };
-            Bot.StartReceiving(HandleUpdateAsync, HandleErrorAsync, receiverOptions);
+            Bot.StartReceiving(HandleUpdateAsync, HandleErrorAsync, receiverOptions, cts.Token);
 
-            Console.WriteLine("Press any key to stop...");
-            Console.ReadKey();
+            Console.WriteLine("Bot is running in background/daemon mode. Press Ctrl+C to stop...");
+            try { await Task.Delay(-1, cts.Token); } catch { }
             SaveData();
         }
 
@@ -120,6 +135,25 @@ namespace StockBotApp
 
             if (Market == null) Market = new();
             if (Users == null) Users = new();
+
+            // پاک‌سازی دیتابیس قدیمی از مقادیر null
+            foreach (var c in Market.Values)
+            {
+                if (c.Orders == null) c.Orders = new();
+                if (c.PriceHistory == null) c.PriceHistory = new();
+                if (c.PriceHistory.Count == 0) c.PriceHistory.Add(c.BaseValue > 0 ? c.BaseValue : 1m);
+                if (c.Symbol == null) c.Symbol = "";
+                if (c.Description == null) c.Description = c.Symbol;
+                if (c.PhotoUrl == null) c.PhotoUrl = "";
+            }
+
+            foreach (var u in Users.Values)
+            {
+                if (u.Username == null) u.Username = "unknown";
+                if (u.Portfolio == null) u.Portfolio = new();
+                if (u.DeviceFingerprints == null) u.DeviceFingerprints = new();
+                if (u.ReferralCode == null) u.ReferralCode = "REF" + u.UserId;
+            }
 
             EnsureTreasuryAccount();
             EnsureDefaultCurrencies();
@@ -250,9 +284,9 @@ namespace StockBotApp
                 var userId = message.From.Id;
                 var text = message.Text?.Trim() ?? "";
 
-                if (!Users.ContainsKey(userId))
+                if (!Users.TryGetValue(userId, out var user) || user == null)
                 {
-                    Users[userId] = new User
+                    user = new User
                     {
                         UserId = userId,
                         Username = message.From.Username ?? "unknown",
@@ -260,12 +294,13 @@ namespace StockBotApp
                         Level = 1,
                         XP = 0
                     };
-                    Users[userId].DeviceFingerprints.Add(userId % 100000);
-                    Users[userId].ReferralCode = "REF" + userId.ToString().Substring(Math.Max(0, userId.ToString().Length - 6));
+                    user.DeviceFingerprints.Add(userId % 100000);
+                    user.ReferralCode = "REF" + userId.ToString().Substring(Math.Max(0, userId.ToString().Length - 6));
+                    Users[userId] = user;
                 }
                 else if (message.From.Username != null)
                 {
-                    Users[userId].Username = message.From.Username;
+                    user.Username = message.From.Username;
                 }
 
                 // مدیریت وضعیت‌های خاص (مانند ارسال عکس یا متن توسط ادمین برای تغییر مشخصات ارز)
@@ -299,9 +334,10 @@ namespace StockBotApp
                 "🏦 تزریق نقدینگی", "🖼 تنظیم عکس ارز", "📝 تنظیم توضیحات ارز",
                 "🗑 حذف ارز", "📈 تنظیم قیمت دستی", "📋 سفارشات باز",
                 "🔄 ریست بازار", "🎲 رویداد تصادفی", "📰 رویدادهای ویژه", "رویدادها",
-                "خبر مثبت", "خبر منفی", "هک", "جنگ", "رکود", "رشد ناگهانی", "سقوط آزاد", "بازگشت"
+                "خبر مثبت", "خبر منفی", "هک", "جنگ", "رکود", "رشد ناگهانی", "سقوط آزاد", "بازگشت",
+                "🏆 لیدربورد", "🏆 لیدربورد برترین‌ها", "🔙 بازگشت به منوی اصلی", "پنل", "admin", "👑 پنل مدیریت"
             };
-            return ownerCmds.Contains(text) || text == "پنل" || text == "admin" || text == "👑 پنل مدیریت";
+            return ownerCmds.Contains(text);
         }
 
         private static async Task<bool> HandleStateAsync(ITelegramBotClient bot, Message message, string state, CancellationToken ct)
@@ -673,7 +709,7 @@ namespace StockBotApp
                     }
                 }
             }
-            else if (text == "🏆 لیدربورد")
+            else if (text == "🏆 لیدربورد" || text == "🏆 لیدربورد برترین‌ها")
             {
                 await SendLeaderboardAsync(bot, chatId, OwnerId, ct);
             }
@@ -687,8 +723,12 @@ namespace StockBotApp
         private static async Task HandleUserCommands(ITelegramBotClient bot, Message message, string text, CancellationToken ct)
         {
             var chatId = message.Chat.Id;
-            var userId = message.From.Id;
-            var user = Users[userId];
+            var userId = message.From?.Id ?? chatId;
+            if (!Users.TryGetValue(userId, out var user) || user == null)
+            {
+                user = new User { UserId = userId, Username = "unknown", Balance = 5000m };
+                Users[userId] = user;
+            }
 
             // مدیریت /start و کدهای رفرال
             if (text == "/start" || text.StartsWith("/start ") || text == "start" || text == "شروع")
@@ -951,6 +991,21 @@ namespace StockBotApp
             var userId = callbackQuery.From.Id;
             long chatId = callbackQuery.Message?.Chat.Id ?? userId;
 
+            if (!Users.TryGetValue(userId, out var user) || user == null)
+            {
+                user = new User
+                {
+                    UserId = userId,
+                    Username = callbackQuery.From.Username ?? "unknown",
+                    Balance = 5000m,
+                    Level = 1,
+                    XP = 0
+                };
+                user.DeviceFingerprints.Add(userId % 100000);
+                user.ReferralCode = "REF" + userId.ToString().Substring(Math.Max(0, userId.ToString().Length - 6));
+                Users[userId] = user;
+            }
+
             if (data.StartsWith("VIEW_SYMBOL_"))
             {
                 var symbol = data.Split('_')[2];
@@ -968,7 +1023,7 @@ namespace StockBotApp
                 {
                     var price = GetCurrentPrice(symbol);
                     string msg = $"🛒 خرید سریع سهام {symbol} — قیمت لحظه‌ای واحد: {FmtPrice(price)}\n\n" +
-                                 $"💵 موجودی دلار نقدی شما: {FmtMoney(Users[userId].Balance)}\n" +
+                                 $"💵 موجودی دلار نقدی شما: {FmtMoney(user.Balance)}\n" +
                                  $"لطفاً مقدار مورد نظر برای خرید فوری در قیمت بازار را انتخاب کنید:";
 
                     var kb = new InlineKeyboardMarkup(new[]
@@ -993,7 +1048,6 @@ namespace StockBotApp
                 var symbol = data.Split('_')[2];
                 if (Market.TryGetValue(symbol, out var c))
                 {
-                    var user = Users[userId];
                     var hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
                     var price = Math.Max(0.01m, GetCurrentPrice(symbol) * 0.95m); // قیمت نقدشوندگی فوری (۵٪ زیر قیمت بازار)
 
@@ -1024,7 +1078,6 @@ namespace StockBotApp
                 var symbol = parts[2];
                 if (long.TryParse(parts[3], out var qty) && Market.TryGetValue(symbol, out var c))
                 {
-                    var user = Users[userId];
                     var price = GetCurrentPrice(symbol);
                     decimal totalCost = price * qty * 1.01m; // ۱٪ کارمزد
 
@@ -1053,7 +1106,6 @@ namespace StockBotApp
                 var symbol = parts[2];
                 if (long.TryParse(parts[3], out var qty) && Market.TryGetValue(symbol, out var c))
                 {
-                    var user = Users[userId];
                     var hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
                     if (hasStock < qty)
                     {
@@ -1080,7 +1132,6 @@ namespace StockBotApp
                 var symbol = data.Split('_')[2];
                 if (Market.TryGetValue(symbol, out var c))
                 {
-                    var user = Users[userId];
                     var hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
                     if (hasStock <= 0)
                     {
@@ -1104,7 +1155,6 @@ namespace StockBotApp
             }
             else if (data == "SHOW_REFERRAL")
             {
-                var user = Users[userId];
                 string refMsg = $"🎁 کد دعوت اختصاصی شما: {user.ReferralCode}\n\n" +
                                 $"🔗 لینک دعوت مستقیم:\n" +
                                 $"https://t.me/{(await bot.GetMe()).Username}?start={user.ReferralCode}\n\n" +
