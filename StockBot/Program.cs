@@ -1710,33 +1710,7 @@ namespace StockBotApp
             // پرتفو
             if (text == "پرتفو" || text == "پورتفولیو" || text == "💼 پرتفو من" || text == "💼 پورتفولیو من")
             {
-                decimal totalStockVal = 0m;
-                string p = $"💼 سبد دارایی و پرتفو شما (@{user.Username}):\n\n" +
-                           $"💵 موجودی نقدی دلار: {FmtMoney(user.Balance)}\n\n" +
-                           $"📦 سهام‌های خریداری‌شده:\n";
-
-                bool hasStock = false;
-                lock (_dataLock)
-                {
-                    foreach (var h in user.Portfolio.Where(x => x.Value > 0))
-                    {
-                        hasStock = true;
-                        decimal curPrice = GetCurrentPrice(h.Key);
-                        decimal val = curPrice * h.Value;
-                        totalStockVal += val;
-                        p += $"🔸 {h.Key}: {h.Value:N0} واحد (ارزش: {FmtMoney(val)} | قیمت واحد: {FmtPrice(curPrice)})\n";
-                    }
-                }
-
-                if (!hasStock)
-                {
-                    p += "🔹 شما در حال حاضر هیچ سهامی در پرتفو ندارید.\n";
-                }
-
-                p += $"\n💎 مجموع ارزش سهام‌ها: {FmtMoney(totalStockVal)}\n" +
-                     $"🏆 ارزش کل دارایی حساب (Net Worth): {FmtMoney(user.Balance + totalStockVal)}";
-
-                await bot.SendMessage(chatId, p, replyMarkup: GetUserKeyboard(userId), cancellationToken: ct);
+                await SendUserPortfolioAsync(bot, chatId, userId, ct);
                 return;
             }
 
