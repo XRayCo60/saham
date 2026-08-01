@@ -783,9 +783,10 @@ namespace StockBotApp
                 "🗑 حذف ارز", "📈 تنظیم قیمت دستی", "📋 سفارشات باز",
                 "🔄 ریست بازار", "🎲 رویداد تصادفی", "📰 رویدادهای ویژه", "رویدادها",
                 "خبر مثبت", "خبر منفی", "هک", "جنگ", "رکود", "رشد ناگهانی", "سقوط آزاد", "بازگشت",
-                "🏆 لیدربورد", "🏆 لیدربورد برترین‌ها", "🔙 بازگشت به منوی اصلی", "پنل", "admin", "👑 پنل مدیریت"
+                "🏆 لیدربورد", "🏆 لیدربورد برترین‌ها", "🔙 بازگشت به منوی اصلی", "پنل", "admin", "👑 پنل مدیریت",
+                "🎁 واریز / مدیریت سهام", "مدیریت سهام"
             };
-            return ownerCmds.Contains(text);
+            return ownerCmds.Contains(text) || text.StartsWith("واریز سهام") || text.StartsWith("برداشت سهام") || text.StartsWith("واریز دلار") || text.StartsWith("برداشت دلار");
         }
 
         private static async Task<bool> HandleStateAsync(ITelegramBotClient bot, Message message, string state, CancellationToken ct)
@@ -1231,6 +1232,16 @@ namespace StockBotApp
             return false;
         }
 
+        private static User? FindUserByIdOrUsername(string input)
+        {
+            input = input.Trim().TrimStart('@');
+            if (long.TryParse(input, out var uid) && Users.TryGetValue(uid, out var userById))
+            {
+                return userById;
+            }
+            return Users.Values.FirstOrDefault(u => string.Equals(u.Username, input, StringComparison.OrdinalIgnoreCase));
+        }
+
         // ===================== OWNER PANEL =====================
         private static async Task HandleOwnerCommands(ITelegramBotClient bot, Message message, string text, CancellationToken ct)
         {
@@ -1307,6 +1318,107 @@ namespace StockBotApp
                 }
 
                 await bot.SendMessage(chatId, msg, replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+            }
+            else if (text == "🎁 واریز / مدیریت سهام" || text == "مدیریت سهام" || text == "واریز سهام")
+            {
+                UserStates[chatId] = "ADM_SELECT_USER";
+                string info = "👑 **مدیریت دارایی و سهام کاربران:**\n\n" +
+                              "لطفاً آیدی عددی (UserId) یا یوزرنیم تلگرام (با @ یا بدون @) کاربری که می‌خواهید سهام یا دلار برایش واریز/کسر کنید را ارسال کنید.\n" +
+                              "*(برای مدیریت حساب مدیریت خودتان، آیدی 8248899977 را بفرستید)*\n\n" +
+                              "💡 همچنین می‌توانید از دستورات متنی سریع زیر استفاده کنید:\n" +
+                              "• `واریز سهام 8248899977 BTC 500`\n" +
+                              "• `برداشت سهام 8248899977 BTC 50`\n" +
+                              "• `واریز دلار 8248899977 10000`\n" +
+                              "• `برداشت دلار 8248899977 1000`";
+                await bot.SendMessage(chatId, info, parseMode: ParseMode.Markdown, cancellationToken: ct);
+            }
+            else if (text.StartsWith("واریز سهام ") || text.StartsWith("برداشت سهام "))
+            {
+                var parts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 5 && long.TryParse(parts[4], out var qty) && qty > 0)
+                {
+                    var targetInput = parts[2];
+                    var symbol = parts[3].ToUpper();
+                    bool isAdd = text.StartsWith("واریز سهام");
+                    User? target;
+                    bool success = false;
+                    lock (_dataLock)
+                    {
+                        target = FindUserByIdOrUsername(targetInput);
+                        if (target != null && Market.ContainsKey(symbol))
+                        {
+                            if (!target.Portfolio.ContainsKey(symbol)) target.Portfolio[symbol] = 0;
+                            if (isAdd)
+                            {
+                                target.Portfolio[symbol] += qty;
+                                success = true;
+                            }
+                            else if (target.Portfolio[symbol] >= qty)
+                            {
+                                target.Portfolio[symbol] -= qty;
+                                success = true;
+                            }
+                        }
+                    }
+                    if (success && target != null)
+                    {
+                        RequestSave();
+                        string actionName = isAdd ? "واریز" : "برداشت/کسر";
+                        await bot.SendMessage(chatId, $"✅ عملیات {actionName} تعداد {qty:N0} واحد سهام {symbol} برای کاربر @{target.Username} (ID: {target.UserId}) با موفقیت انجام شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        try { _ = Bot.SendMessage(target.UserId, $"🎁 **اعلان مدیریت:** تعداد {qty:N0} واحد سهام {symbol} به دستور مدیریت {(isAdd ? "به سبد دارایی شما واریز شد" : "از سبد دارایی شما کسر شد")}.", parseMode: ParseMode.Markdown); } catch { }
+                    }
+                    else
+                    {
+                        await bot.SendMessage(chatId, "❌ خطا: کاربر یا ارز مورد نظر یافت نشد، یا موجودی سهام کاربر برای برداشت کافی نیست.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                    }
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, "❌ فرمت دستور نادرست است. مثال: واریز سهام 8248899977 BTC 500", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                }
+            }
+            else if (text.StartsWith("واریز دلار ") || text.StartsWith("برداشت دلار "))
+            {
+                var parts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 4 && decimal.TryParse(parts[3], out var amount) && amount > 0)
+                {
+                    var targetInput = parts[2];
+                    bool isAdd = text.StartsWith("واریز دلار");
+                    User? target;
+                    bool success = false;
+                    lock (_dataLock)
+                    {
+                        target = FindUserByIdOrUsername(targetInput);
+                        if (target != null)
+                        {
+                            if (isAdd)
+                            {
+                                target.Balance += amount;
+                                success = true;
+                            }
+                            else if (target.Balance >= amount)
+                            {
+                                target.Balance -= amount;
+                                success = true;
+                            }
+                        }
+                    }
+                    if (success && target != null)
+                    {
+                        RequestSave();
+                        string actionName = isAdd ? "واریز" : "برداشت/کسر";
+                        await bot.SendMessage(chatId, $"✅ عملیات {actionName} مبلغ {FmtMoney(amount)} برای کاربر @{target.Username} (ID: {target.UserId}) با موفقیت انجام شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        try { _ = Bot.SendMessage(target.UserId, $"🎁 **اعلان مدیریت:** مبلغ {FmtMoney(amount)} به دستور مدیریت {(isAdd ? "به موجودی نقدی شما واریز شد" : "از حساب شما کسر شد")}.", parseMode: ParseMode.Markdown); } catch { }
+                    }
+                    else
+                    {
+                        await bot.SendMessage(chatId, "❌ خطا: کاربر یافت نشد یا موجودی کاربر برای برداشت کافی نیست.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                    }
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, "❌ فرمت دستور نادرست است. مثال: واریز دلار 8248899977 5000", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                }
             }
             else if (text == "🏦 تزریق نقدینگی")
             {
@@ -2369,8 +2481,8 @@ namespace StockBotApp
             {
                 new[]
                 {
-                    InlineKeyboardButton.WithCallbackData("🛒 خرید فوری", $"BUY_MENU_{symbol}"),
-                    InlineKeyboardButton.WithCallbackData("💰 فروش فوری", $"SELL_MENU_{symbol}")
+                    InlineKeyboardButton.WithCallbackData("🛒 خرید فوری (از خزانه / تابلو)", $"BUY_MENU_{symbol}"),
+                    InlineKeyboardButton.WithCallbackData("💰 ثبت سفارش فروش P2P (تابلو)", $"LIMIT_SELL_INPUT_{symbol}")
                 },
                 new[]
                 {
@@ -2474,15 +2586,15 @@ namespace StockBotApp
 
         private static async Task SendSellMenuSelectorAsync(ITelegramBotClient bot, long chatId, CancellationToken ct)
         {
-            string msg = "💰 منوی انتخاب ارز برای فروش سهام:\n\n" +
-                         "ارز مورد نظر را از لیست زیر انتخاب کنید یا از دستور متنی زیر استفاده کنید:\n" +
-                         "مثال: فروش BTC 5 65000";
+            string msg = "💰 منوی انتخاب ارز برای ثبت سفارش فروش در تابلوی معاملاتی (بورس P2P):\n\n" +
+                         "در بازار همتا به همتا، سفارش فروش شما در تابلوی بورس (صف فروش) ثبت شده و توسط خریداران واقعی معامله می‌شود.\n" +
+                         "لطفاً ارز مورد نظر را انتخاب کنید:";
 
             List<InlineKeyboardButton> symbolButtons;
             lock (_dataLock)
             {
                 symbolButtons = Market.Keys.Select(sym =>
-                    InlineKeyboardButton.WithCallbackData($"💰 فروش {sym}", $"SELL_MENU_{sym}")
+                    InlineKeyboardButton.WithCallbackData($"💰 فروش P2P {sym}", $"LIMIT_SELL_INPUT_{sym}")
                 ).ToList();
             }
 
@@ -2638,10 +2750,10 @@ namespace StockBotApp
             return new ReplyKeyboardMarkup(new[]
             {
                 new KeyboardButton[] { "➕ اضافه کردن ارز", "📊 مرور بازار", "💰 موجودی کاربران" },
-                new KeyboardButton[] { "🏦 تزریق نقدینگی", "🖼 تنظیم عکس ارز", "📝 تنظیم توضیحات ارز" },
-                new KeyboardButton[] { "🗑 حذف ارز", "📈 تنظیم قیمت دستی", "📋 سفارشات باز" },
-                new KeyboardButton[] { "🔄 ریست بازار", "🎲 رویداد تصادفی", "📰 رویدادهای ویژه" },
-                new KeyboardButton[] { "🏆 لیدربورد", "🔙 بازگشت به منوی اصلی" }
+                new KeyboardButton[] { "🎁 واریز / مدیریت سهام", "🏦 تزریق نقدینگی", "🖼 تنظیم عکس ارز" },
+                new KeyboardButton[] { "📝 تنظیم توضیحات ارز", "🗑 حذف ارز", "📈 تنظیم قیمت دستی" },
+                new KeyboardButton[] { "📋 سفارشات باز", "🔄 ریست بازار", "🎲 رویداد تصادفی" },
+                new KeyboardButton[] { "📰 رویدادهای ویژه", "🏆 لیدربورد", "🔙 بازگشت به منوی اصلی" }
             }) { ResizeKeyboard = true };
         }
 
