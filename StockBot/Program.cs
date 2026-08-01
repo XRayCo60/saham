@@ -1,6 +1,6 @@
-// StockBot.cs - Naomi (نائومی) Telegram Trading Bot (Dual-Engine SQLite + High-Speed JSON Fallback)
+// StockBot.cs - Naomi (نائومی) Telegram Trading Bot (Dynamic AMM Price Impact + Flexible Buy/Sell UI)
 // تک‌فایل C# کامل - بدون هیچ دستوری که با / شروع شود
-// مجهز به دیتابیس دوگانه خارج از مسیر مخزن، حفاظت دائمی از اطلاعات بعد از ریستارت و سرعت پاسخ‌دهی آنی
+// مجهز به دیتابیس دوگانه، قیمت‌گذاری پویا بر اساس عرضه و تقاضا، و امکان خرید/فروش هر تعداد واحد دلخواه
 
 using System;
 using System.Collections.Generic;
@@ -685,7 +685,7 @@ namespace StockBotApp
                     user.Username = message.From.Username;
                 }
 
-                // مدیریت وضعیت‌های خاص (مانند ارسال عکس یا متن توسط ادمین برای تغییر مشخصات ارز)
+                // مدیریت وضعیت‌های خاص (مانند ارسال عکس، متن یا وارد کردن مقدار دلخواه خرید و فروش)
                 if (UserStates.TryGetValue(chatId, out var state))
                 {
                     if (await HandleStateAsync(bot, message, state, ct))
@@ -891,6 +891,74 @@ namespace StockBotApp
                     return true;
                 }
             }
+            else if (state.StartsWith("CUSTOM_BUY_QTY_"))
+            {
+                var symbol = state.Split('_')[3];
+                if (long.TryParse(text, out var qty) && qty > 0 && Market.TryGetValue(symbol, out var c))
+                {
+                    var user = Users[message.From!.Id];
+                    var price = GetCurrentPrice(symbol);
+                    decimal totalCost = price * qty * 1.01m; // ۱٪ کارمزد
+                    if (user.Balance < totalCost)
+                    {
+                        await bot.SendMessage(chatId, $"❌ موجودی نقدی دلار شما کافی نیست.\nمبلغ مورد نیاز با کارمزد: {FmtMoney(totalCost)}\nموجودی شما: {FmtMoney(user.Balance)}", cancellationToken: ct);
+                    }
+                    else
+                    {
+                        var order = new Order { UserId = user.UserId, Type = "BUY", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
+                        c.Orders.Add(order);
+                        MatchOrders(symbol, user.UserId);
+                        RequestSave();
+                        await bot.SendMessage(
+                            chatId,
+                            $"✅ خرید فوری {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} با موفقیت انجام شد!\n💰 موجودی جدید دلار شما: {FmtMoney(user.Balance)}",
+                            replyMarkup: user.UserId == OwnerId ? GetOwnerKeyboard() : GetUserKeyboard(user.UserId),
+                            cancellationToken: ct
+                        );
+                    }
+                    UserStates.Remove(chatId);
+                    return true;
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, "❌ لطفاً یک عدد معتبر بزرگتر از ۰ وارد کنید (یا تایپ کنید لغو):", cancellationToken: ct);
+                    return true;
+                }
+            }
+            else if (state.StartsWith("CUSTOM_SELL_QTY_"))
+            {
+                var symbol = state.Split('_')[3];
+                if (long.TryParse(text, out var qty) && qty > 0 && Market.TryGetValue(symbol, out var c))
+                {
+                    var user = Users[message.From!.Id];
+                    var hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                    if (hasStock < qty)
+                    {
+                        await bot.SendMessage(chatId, $"❌ موجودی سهام {symbol} شما کافی نیست. موجودی شما: {hasStock:N0} واحد", cancellationToken: ct);
+                    }
+                    else
+                    {
+                        var price = Math.Max(0.01m, GetCurrentPrice(symbol) * 0.95m);
+                        var order = new Order { UserId = user.UserId, Type = "SELL", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
+                        c.Orders.Add(order);
+                        MatchOrders(symbol, user.UserId);
+                        RequestSave();
+                        await bot.SendMessage(
+                            chatId,
+                            $"✅ فروش فوری {qty:N0} واحد {symbol} به قیمت واحد {FmtPrice(price)} با موفقیت انجام شد!\n💰 موجودی جدید دلار شما: {FmtMoney(user.Balance)}",
+                            replyMarkup: user.UserId == OwnerId ? GetOwnerKeyboard() : GetUserKeyboard(user.UserId),
+                            cancellationToken: ct
+                        );
+                    }
+                    UserStates.Remove(chatId);
+                    return true;
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, "❌ لطفاً یک عدد معتبر بزرگتر از ۰ وارد کنید (یا تایپ کنید لغو):", cancellationToken: ct);
+                    return true;
+                }
+            }
 
             return false;
         }
@@ -1039,6 +1107,7 @@ namespace StockBotApp
                     var newPrice = Math.Max(0.01m, currency.PriceHistory.LastOrDefault(currency.BaseValue) * (1 + change / 100m));
 
                     currency.PriceHistory.Add(newPrice);
+                    AdjustTreasuryOrders(currency, newPrice);
 
                     string eventMsg = $"🎲 رویداد تصادفی بازار!\nارز {symbol} با تغییر {change:+0;-0}% مواجه شد!\n💵 قیمت جدید: {FmtPrice(newPrice)}";
                     await bot.SendMessage(chatId, eventMsg, replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
@@ -1081,6 +1150,7 @@ namespace StockBotApp
 
                     var newPrice = Math.Max(0.01m, currency.PriceHistory.LastOrDefault(currency.BaseValue) * (1 + change / 100m));
                     currency.PriceHistory.Add(newPrice);
+                    AdjustTreasuryOrders(currency, newPrice);
 
                     string eventMsg = $"📰 رویداد ویژه بازار: {text}\nارز {symbol} با تغییر {change:+0;-0}% مواجه شد!\n💵 قیمت جدید: {FmtPrice(newPrice)}";
                     await bot.SendMessage(chatId, eventMsg, replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
@@ -1412,13 +1482,20 @@ namespace StockBotApp
                     {
                         new[]
                         {
-                            InlineKeyboardButton.WithCallbackData("🛒 ۱۰ واحد", $"QUICK_BUY_{symbol}_10"),
-                            InlineKeyboardButton.WithCallbackData("🛒 ۵۰ واحد", $"QUICK_BUY_{symbol}_50"),
-                            InlineKeyboardButton.WithCallbackData("🛒 ۱۰۰ واحد", $"QUICK_BUY_{symbol}_100")
+                            InlineKeyboardButton.WithCallbackData("🛒 ۱ واحد", $"QUICK_BUY_{symbol}_1"),
+                            InlineKeyboardButton.WithCallbackData("🛒 ۳ واحد", $"QUICK_BUY_{symbol}_3"),
+                            InlineKeyboardButton.WithCallbackData("🛒 ۵ واحد", $"QUICK_BUY_{symbol}_5")
                         },
                         new[]
                         {
-                            InlineKeyboardButton.WithCallbackData("🔙 بازگشت به پنل ارز", $"VIEW_SYMBOL_{symbol}")
+                            InlineKeyboardButton.WithCallbackData("🛒 ۱۰ واحد", $"QUICK_BUY_{symbol}_10"),
+                            InlineKeyboardButton.WithCallbackData("🛒 ۲۵ واحد", $"QUICK_BUY_{symbol}_25"),
+                            InlineKeyboardButton.WithCallbackData("🛒 ۵۰ واحد", $"QUICK_BUY_{symbol}_50")
+                        },
+                        new[]
+                        {
+                            InlineKeyboardButton.WithCallbackData("✍️ خرید مقدار دلخواه", $"CUSTOM_BUY_INPUT_{symbol}"),
+                            InlineKeyboardButton.WithCallbackData("🔙 بازگشت", $"VIEW_SYMBOL_{symbol}")
                         }
                     });
 
@@ -1441,9 +1518,20 @@ namespace StockBotApp
                     {
                         new[]
                         {
+                            InlineKeyboardButton.WithCallbackData("💰 ۱ واحد", $"QUICK_SELL_{symbol}_1"),
+                            InlineKeyboardButton.WithCallbackData("💰 ۳ واحد", $"QUICK_SELL_{symbol}_3"),
+                            InlineKeyboardButton.WithCallbackData("💰 ۵ واحد", $"QUICK_SELL_{symbol}_5")
+                        },
+                        new[]
+                        {
                             InlineKeyboardButton.WithCallbackData("💰 ۱۰ واحد", $"QUICK_SELL_{symbol}_10"),
-                            InlineKeyboardButton.WithCallbackData("💰 ۵۰ واحد", $"QUICK_SELL_{symbol}_50"),
-                            InlineKeyboardButton.WithCallbackData("🔥 فروش همه موجودی", $"SELL_ALL_{symbol}")
+                            InlineKeyboardButton.WithCallbackData("💰 ۲۵ واحد", $"QUICK_SELL_{symbol}_25"),
+                            InlineKeyboardButton.WithCallbackData("💰 ۵۰ واحد", $"QUICK_SELL_{symbol}_50")
+                        },
+                        new[]
+                        {
+                            InlineKeyboardButton.WithCallbackData("🔥 فروش همه موجودی", $"SELL_ALL_{symbol}"),
+                            InlineKeyboardButton.WithCallbackData("✍️ فروش مقدار دلخواه", $"CUSTOM_SELL_INPUT_{symbol}")
                         },
                         new[]
                         {
@@ -1453,6 +1541,28 @@ namespace StockBotApp
 
                     await bot.SendMessage(chatId, msg, replyMarkup: kb, cancellationToken: ct);
                 }
+            }
+            else if (data.StartsWith("CUSTOM_BUY_INPUT_"))
+            {
+                var symbol = data.Split('_')[3];
+                UserStates[chatId] = $"CUSTOM_BUY_QTY_{symbol}";
+                var price = GetCurrentPrice(symbol);
+                await bot.SendMessage(
+                    chatId,
+                    $"🛒 لطفاً تعداد واحد مورد نظر برای خرید فوری {symbol} به قیمت لحظه‌ای واحد ({FmtPrice(price)}) را به صورت یک عدد وارد کنید (مثال: 3 یا 15):",
+                    cancellationToken: ct
+                );
+            }
+            else if (data.StartsWith("CUSTOM_SELL_INPUT_"))
+            {
+                var symbol = data.Split('_')[3];
+                UserStates[chatId] = $"CUSTOM_SELL_QTY_{symbol}";
+                var hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                await bot.SendMessage(
+                    chatId,
+                    $"💰 لطفاً تعداد واحد مورد نظر برای فروش فوری {symbol} را وارد کنید (موجودی سهام شما: {hasStock:N0} واحد):",
+                    cancellationToken: ct
+                );
             }
             else if (data.StartsWith("QUICK_BUY_"))
             {
@@ -1886,8 +1996,23 @@ namespace StockBotApp
                             buy.Quantity -= matchQty;
                             sell.Quantity -= matchQty;
 
-                            currency.PriceHistory.Add(tradePrice);
+                            // محاسبه قیمت پویا بر اساس عرضه و تقاضا (Dynamic AMM Price Impact)
+                            decimal impactPct = Math.Max(0.0004m * matchQty, (decimal)matchQty / Math.Max(1000m, (decimal)currency.CirculatingSupply) * 0.12m);
+                            decimal newTradePrice = tradePrice;
+                            if (buy.UserId == triggeredByUserId || sell.UserId == 0) // تقاضای خرید (کاربر خریدار است)
+                            {
+                                newTradePrice = Math.Max(0.01m, tradePrice * (1m + impactPct));
+                            }
+                            else // فشار فروش (کاربر فروشنده است)
+                            {
+                                newTradePrice = Math.Max(0.01m, tradePrice * (1m - (impactPct * 0.75m)));
+                            }
+
+                            currency.PriceHistory.Add(newTradePrice);
                             if (currency.PriceHistory.Count > 100) currency.PriceHistory.RemoveAt(0);
+
+                            // به‌روزرسانی خودکار سفارشات خزانه با قیمت جدید بازار
+                            AdjustTreasuryOrders(currency, newTradePrice);
 
                             if (buy.UserId != 0 && sell.UserId != 0)
                             {
@@ -1898,6 +2023,25 @@ namespace StockBotApp
                 }
             }
             currency.Orders.RemoveAll(o => o.Quantity <= 0);
+        }
+
+        private static void AdjustTreasuryOrders(Currency currency, decimal newPrice)
+        {
+            foreach (var order in currency.Orders.Where(o => o.UserId == 0))
+            {
+                if (order.Type == "SELL")
+                {
+                    order.Price = newPrice;
+                    if (order.Quantity < currency.CirculatingSupply / 10)
+                        order.Quantity = Math.Max(1000, currency.TotalSupply / 10);
+                }
+                else if (order.Type == "BUY")
+                {
+                    order.Price = Math.Max(0.01m, newPrice * 0.95m);
+                    if (order.Quantity < currency.CirculatingSupply / 10)
+                        order.Quantity = Math.Max(1000, currency.TotalSupply / 10);
+                }
+            }
         }
 
         private static void UpdateUserStats(User buyer, User seller)
