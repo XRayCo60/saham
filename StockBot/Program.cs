@@ -2889,6 +2889,7 @@ namespace StockBotApp
 
         private static async Task SendGraphicChartAsync(ITelegramBotClient bot, long chatId, string symbol, string timeframe, CancellationToken ct)
         {
+            DateTime[] timePoints;
             decimal[] prices;
             decimal baseValue;
             decimal curPrice;
@@ -2910,6 +2911,7 @@ namespace StockBotApp
             {
                 if (!Market.TryGetValue(symbol, out var c))
                 {
+                    timePoints = Array.Empty<DateTime>();
                     prices = Array.Empty<decimal>();
                     baseValue = 1m;
                     curPrice = 1m;
@@ -2918,16 +2920,17 @@ namespace StockBotApp
                 {
                     baseValue = c.BaseValue;
                     curPrice = GetCurrentPrice(symbol);
-                    var subset = c.TimedPriceHistory.Where(p => p.Timestamp >= minTime).Select(p => p.Price).ToList();
+                    var subset = c.TimedPriceHistory.Where(p => p.Timestamp >= minTime).ToList();
                     if (subset.Count == 0)
                     {
-                        subset = c.PriceHistory.TakeLast(30).ToList();
+                        subset = c.TimedPriceHistory.TakeLast(30).ToList();
                     }
                     if (subset.Count == 1)
                     {
-                        subset.Insert(0, c.BaseValue);
+                        subset.Insert(0, new PricePoint { Timestamp = subset[0].Timestamp.AddMinutes(-30), Price = c.BaseValue });
                     }
-                    prices = subset.ToArray();
+                    timePoints = subset.Select(p => p.Timestamp).ToArray();
+                    prices = subset.Select(p => p.Price).ToArray();
                 }
             }
 
@@ -2945,17 +2948,19 @@ namespace StockBotApp
 
             try
             {
+                double[] xs = timePoints.Select(dt => dt.ToOADate()).ToArray();
+                double[] ys = prices.Select(p => (double)p).ToArray();
+
                 var plt = new Plot();
-                var scatter = plt.Add.Scatter(
-                    Enumerable.Range(1, prices.Length).Select(i => (double)i).ToArray(),
-                    prices.Select(p => (double)p).ToArray()
-                );
-                scatter.LineWidth = 3;
-                scatter.MarkerSize = 7;
-                plt.Title($"{symbol} / USD — {tfTitle} ({shamsiTime})");
-                plt.XLabel("معاملات ثبت‌شده (Trades)");
-                plt.YLabel("قیمت واحد دلاری ($)");
-                plt.Axes.Left.Label.Text = "قیمت ($)";
+                var scatter = plt.Add.Scatter(xs, ys);
+                scatter.LineWidth = 2.5f;
+                scatter.MarkerSize = 5;
+
+                plt.Axes.DateTimeTicksBottom(); // تبدیل هوشمند محور افقی به تاریخ و ساعت واقعی
+                plt.Title($"{symbol} / USD — {timeframe.ToUpper()} Chart");
+                plt.XLabel("Time (Tehran Time — HH:mm / Date)");
+                plt.YLabel("Price ($ USD)");
+                plt.Axes.Left.Label.Text = "Price ($)";
 
                 string filePath = $"{symbol}_chart_{DateTime.UtcNow.Ticks}.png";
                 await Task.Run(() => plt.SavePng(filePath, 800, 400), ct);
@@ -3148,20 +3153,30 @@ namespace StockBotApp
                             buy.Quantity -= matchQty;
                             sell.Quantity -= matchQty;
 
-                            // محاسبه قیمت پویا بر اساس عرضه و تقاضا با دامنه نوسان (Dynamic AMM Price Impact + Circuit Breaker)
-                            decimal impactPct = Math.Min(0.15m, Math.Max(0.0004m * matchQty, (decimal)matchQty / Math.Max(1000m, (decimal)currency.CirculatingSupply) * 0.12m));
+                            // موتور پیشرفته الاستیک قیمت‌گذاری ارز بر اساس حجم دلاری معامله و ارزش کل بازار (Advanced Elastic AMM & Bonding Curve)
+                            decimal tradeVolume = tradePrice * matchQty;
+                            decimal marketCap = Math.Max(10000m, currency.CirculatingSupply * tradePrice);
+                            decimal volumeRatio = tradeVolume / marketCap;
+                            decimal elasticity = Math.Max(0.06m, Math.Min(0.40m, 50000m / marketCap));
+                            decimal impactPct = Math.Min(0.15m, Math.Max(0.0002m, (decimal)Math.Sqrt((double)volumeRatio) * elasticity));
+
                             decimal newTradePrice = tradePrice;
-                            if (buy.UserId != 0 && sell.UserId == 0) // تقاضای خرید از خزانه -> ۱۰۰٪ افزایش قیمت
+                            if (buy.UserId != 0 && sell.UserId == 0) // تقاضای خرید از خزانه -> ۱۰۰٪ افزایش قیمت بر اساس الاستیسیته
                             {
                                 newTradePrice = Math.Max(0.01m, tradePrice * (1m + impactPct));
                             }
                             else if (buy.UserId == 0 && sell.UserId != 0) // فشار فروش به خزانه -> ۱۰۰٪ کاهش قیمت
                             {
-                                newTradePrice = Math.Max(0.01m, tradePrice * (1m - (impactPct * 0.75m)));
+                                newTradePrice = Math.Max(0.01m, tradePrice * (1m - (impactPct * 0.85m)));
                             }
-                            else // معامله P2P بین دو کاربر واقعی (ثبت قیمت توافقی به عنوان قیمت لحظه‌ای بازار)
+                            else // معامله P2P بین دو کاربر واقعی
                             {
-                                newTradePrice = tradePrice;
+                                if (buy.Price >= tradePrice * 1.001m)
+                                    newTradePrice = Math.Max(0.01m, tradePrice * (1m + (impactPct * 0.6m)));
+                                else if (sell.Price <= tradePrice * 0.999m)
+                                    newTradePrice = Math.Max(0.01m, tradePrice * (1m - (impactPct * 0.6m)));
+                                else
+                                    newTradePrice = tradePrice;
                             }
 
                             currency.PriceHistory.Add(newTradePrice);
