@@ -481,6 +481,12 @@ namespace StockBotApp
                 if (u.DeviceFingerprints == null) u.DeviceFingerprints = new();
                 if (u.ReferralCode == null) u.ReferralCode = "REF" + u.UserId;
             }
+
+            foreach (var symbol in Market.Keys.ToList())
+            {
+                EnsureInitialLiquidity(symbol);
+                MatchOrders(symbol, 0);
+            }
         }
 
         private static void LoadFromSqlite(SqliteConnection conn)
@@ -620,8 +626,11 @@ namespace StockBotApp
         {
             if (!Market.TryGetValue(symbol, out var currency)) return;
 
-            // ایجاد سفارش فروش اولیه خزانه در قیمت پایه
-            if (!currency.Orders.Any(o => o.Type == "SELL"))
+            decimal curPrice = GetCurrentPrice(symbol);
+            if (curPrice <= 0) curPrice = currency.BaseValue > 0 ? currency.BaseValue : 1m;
+
+            // ایجاد یا احیای سفارش فروش اولیه خزانه در قیمت جاری بازار
+            if (!currency.Orders.Any(o => o.Type == "SELL" && o.UserId == 0 && o.Quantity > 0))
             {
                 long ipoQty = currency.CirculatingSupply;
                 if (ipoQty <= 0) ipoQty = Math.Max(1000, currency.TotalSupply / 10);
@@ -629,18 +638,18 @@ namespace StockBotApp
                 {
                     UserId = 0,
                     Type = "SELL",
-                    Price = currency.BaseValue,
+                    Price = curPrice,
                     Quantity = ipoQty,
                     Timestamp = DateTime.UtcNow
                 });
             }
 
-            // ایجاد سفارش خرید تضمینی جهت نقدشوندگی فوری کاربران (۵٪ زیر قیمت پایه)
-            if (!currency.Orders.Any(o => o.Type == "BUY"))
+            // ایجاد سفارش خرید تضمینی جهت نقدشوندگی فوری کاربران (۵٪ زیر قیمت جاری بازار)
+            if (!currency.Orders.Any(o => o.Type == "BUY" && o.UserId == 0 && o.Quantity > 0))
             {
                 long buyQty = currency.CirculatingSupply;
                 if (buyQty <= 0) buyQty = Math.Max(1000, currency.TotalSupply / 10);
-                decimal buyPrice = Math.Max(0.01m, currency.BaseValue * 0.95m);
+                decimal buyPrice = Math.Max(0.01m, curPrice * 0.95m);
                 currency.Orders.Add(new Order
                 {
                     UserId = 0,
@@ -2242,6 +2251,7 @@ namespace StockBotApp
         // ===================== MATCHING ENGINE =====================
         private static void MatchOrders(string symbol, long triggeredByUserId)
         {
+            EnsureInitialLiquidity(symbol);
             if (!Market.TryGetValue(symbol, out var currency)) return;
             var buys = currency.Orders.Where(o => o.Type == "BUY" && o.Quantity > 0).OrderByDescending(o => o.Price).ToList();
             var sells = currency.Orders.Where(o => o.Type == "SELL" && o.Quantity > 0).OrderBy(o => o.Price).ToList();
