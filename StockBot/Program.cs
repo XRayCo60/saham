@@ -55,6 +55,7 @@ namespace StockBotApp
             public string Username { get; set; } = "";
             public decimal Balance { get; set; } = 5000m;
             public Dictionary<string, long> Portfolio { get; set; } = new();
+            public Dictionary<string, decimal> CostBasis { get; set; } = new();
             public List<long> DeviceFingerprints { get; set; } = new();
             public DateTime LastDailyReward { get; set; }
 
@@ -131,6 +132,7 @@ namespace StockBotApp
                     Referrals INTEGER,
                     LastDailyReward TEXT,
                     PortfolioJson TEXT,
+                    CostBasisJson TEXT,
                     DeviceFingerprintsJson TEXT
                 );
 
@@ -145,6 +147,13 @@ namespace StockBotApp
                 );
             ";
             cmd.ExecuteNonQuery();
+            try
+            {
+                using var altCmd = conn.CreateCommand();
+                altCmd.CommandText = "ALTER TABLE Users ADD COLUMN CostBasisJson TEXT;";
+                altCmd.ExecuteNonQuery();
+            }
+            catch { }
             return conn;
         }
 
@@ -180,6 +189,7 @@ namespace StockBotApp
                     Username = u.Username,
                     Balance = u.Balance,
                     Portfolio = new Dictionary<string, long>(u.Portfolio),
+                    CostBasis = new Dictionary<string, decimal>(u.CostBasis),
                     DeviceFingerprints = new List<long>(u.DeviceFingerprints),
                     LastDailyReward = u.LastDailyReward,
                     Level = u.Level,
@@ -291,8 +301,8 @@ namespace StockBotApp
                 using var insCmd = conn.CreateCommand();
                 insCmd.Transaction = trans;
                 insCmd.CommandText = @"
-                    INSERT OR REPLACE INTO Users (UserId, Username, Balance, Level, XP, TotalTrades, SuccessfulTrades, TotalProfit, CrisisSurvived, ReferralCode, Referrals, LastDailyReward, PortfolioJson, DeviceFingerprintsJson)
-                    VALUES (@uid, @un, @bal, @lvl, @xp, @tt, @st, @tp, @cs, @rc, @ref, @ldr, @port, @fp)";
+                    INSERT OR REPLACE INTO Users (UserId, Username, Balance, Level, XP, TotalTrades, SuccessfulTrades, TotalProfit, CrisisSurvived, ReferralCode, Referrals, LastDailyReward, PortfolioJson, CostBasisJson, DeviceFingerprintsJson)
+                    VALUES (@uid, @un, @bal, @lvl, @xp, @tt, @st, @tp, @cs, @rc, @ref, @ldr, @port, @cb, @fp)";
                 insCmd.Parameters.AddWithValue("@uid", u.UserId);
                 insCmd.Parameters.AddWithValue("@un", u.Username ?? "unknown");
                 insCmd.Parameters.AddWithValue("@bal", u.Balance);
@@ -306,6 +316,7 @@ namespace StockBotApp
                 insCmd.Parameters.AddWithValue("@ref", u.Referrals);
                 insCmd.Parameters.AddWithValue("@ldr", u.LastDailyReward.ToString("o"));
                 insCmd.Parameters.AddWithValue("@port", JsonConvert.SerializeObject(u.Portfolio));
+                insCmd.Parameters.AddWithValue("@cb", JsonConvert.SerializeObject(u.CostBasis));
                 insCmd.Parameters.AddWithValue("@fp", JsonConvert.SerializeObject(u.DeviceFingerprints));
                 insCmd.ExecuteNonQuery();
             }
@@ -523,8 +534,14 @@ namespace StockBotApp
             {
                 if (u.Username == null) u.Username = "unknown";
                 if (u.Portfolio == null) u.Portfolio = new();
+                if (u.CostBasis == null) u.CostBasis = new();
                 if (u.DeviceFingerprints == null) u.DeviceFingerprints = new();
                 if (u.ReferralCode == null) u.ReferralCode = "REF" + u.UserId;
+                foreach (var h in u.Portfolio.Where(x => x.Value > 0))
+                {
+                    if (!u.CostBasis.ContainsKey(h.Key))
+                        u.CostBasis[h.Key] = GetCurrentPrice(h.Key);
+                }
             }
 
             foreach (var symbol in Market.Keys.ToList())
@@ -587,7 +604,7 @@ namespace StockBotApp
             // 3. لود کاربران
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText = "SELECT UserId, Username, Balance, Level, XP, TotalTrades, SuccessfulTrades, TotalProfit, CrisisSurvived, ReferralCode, Referrals, LastDailyReward, PortfolioJson, DeviceFingerprintsJson FROM Users";
+                cmd.CommandText = "SELECT UserId, Username, Balance, Level, XP, TotalTrades, SuccessfulTrades, TotalProfit, CrisisSurvived, ReferralCode, Referrals, LastDailyReward, PortfolioJson, DeviceFingerprintsJson, CostBasisJson FROM Users";
                 using var reader = cmd.ExecuteReader();
                 while (reader.Read())
                 {
@@ -612,6 +629,12 @@ namespace StockBotApp
 
                     var fpJson = reader.IsDBNull(13) ? "[]" : reader.GetString(13);
                     u.DeviceFingerprints = JsonConvert.DeserializeObject<List<long>>(fpJson) ?? new();
+
+                    if (reader.FieldCount > 14 && !reader.IsDBNull(14))
+                    {
+                        var cbJson = reader.GetString(14);
+                        u.CostBasis = JsonConvert.DeserializeObject<Dictionary<string, decimal>>(cbJson) ?? new();
+                    }
 
                     Users[userId] = u;
                 }
@@ -2450,8 +2473,10 @@ namespace StockBotApp
         private static async Task SendUserPortfolioAsync(ITelegramBotClient bot, long chatId, long userId, CancellationToken ct)
         {
             User? uCopy = null;
-            var holdings = new List<(string Symbol, long Qty, decimal Price, decimal Value)>();
+            var holdings = new List<(string Symbol, long Qty, decimal Price, decimal Value, decimal CostBasis, decimal PnL, decimal PnLPct)>();
             decimal balance = 0m;
+            decimal totalStockVal = 0m;
+            decimal totalCostBasisVal = 0m;
 
             lock (_dataLock)
             {
@@ -2463,20 +2488,31 @@ namespace StockBotApp
                     {
                         decimal curPrice = GetCurrentPrice(h.Key);
                         decimal val = curPrice * h.Value;
-                        holdings.Add((h.Key, h.Value, curPrice, val));
+                        decimal basis = u.CostBasis.TryGetValue(h.Key, out var cb) ? cb : curPrice;
+                        decimal costVal = basis * h.Value;
+                        decimal pnl = val - costVal;
+                        decimal pnlPct = basis > 0 ? ((curPrice - basis) / basis) * 100m : 0m;
+
+                        holdings.Add((h.Key, h.Value, curPrice, val, basis, pnl, pnlPct));
+                        totalStockVal += val;
+                        totalCostBasisVal += costVal;
                     }
                 }
             }
 
             if (uCopy == null) return;
 
-            decimal totalStockVal = holdings.Sum(x => x.Value);
             decimal netWorth = balance + totalStockVal;
+            decimal totalUnrealizedPnL = totalStockVal - totalCostBasisVal;
+            decimal totalUnrealizedPct = totalCostBasisVal > 0 ? (totalUnrealizedPnL / totalCostBasisVal) * 100m : 0m;
+            string totalPnLIcon = totalUnrealizedPnL >= 0 ? "🟢" : "🔴";
+            string totalPnLSign = totalUnrealizedPnL >= 0 ? "+" : "";
 
             string msg = $"💼 پرتفو و سبد دارایی اختصاصی — @{uCopy.Username}\n\n" +
                          $"💵 موجودی نقدی دلار (Cash): {FmtMoney(balance)}\n" +
                          $"💎 مجموع ارزش سهام‌ها (Stock): {FmtMoney(totalStockVal)}\n" +
-                         $"🏆 ارزش کل دارایی حساب (Net Worth): {FmtMoney(netWorth)}\n\n" +
+                         $"🏆 ارزش کل دارایی حساب (Net Worth): {FmtMoney(netWorth)}\n" +
+                         $"{totalPnLIcon} سود/زیان باز کل سبد: {totalPnLSign}{FmtMoney(totalUnrealizedPnL)} ({totalPnLSign}{totalUnrealizedPct:N1}%)\n\n" +
                          $"━━━━━━━━━━━━━━━━━━━━━━\n";
 
             if (holdings.Count == 0)
@@ -2491,10 +2527,14 @@ namespace StockBotApp
                 foreach (var h in holdings.OrderByDescending(x => x.Value))
                 {
                     decimal sharePct = totalStockVal > 0 ? (h.Value / totalStockVal) * 100m : 0m;
+                    string pnlIcon = h.PnL >= 0 ? "🟢" : "🔴";
+                    string pnlSign = h.PnL >= 0 ? "+" : "";
                     msg += $"┌ 🏷 نماد: {h.Symbol} — (سهم از سبد سهام: {sharePct:N1}%)\n" +
                            $"├ 📦 موجودی سهام: {h.Qty:N0} واحد\n" +
-                           $"├ 💵 قیمت واحد لحظه‌ای: {FmtPrice(h.Price)}\n" +
-                           $"└ 💎 ارزش کل این سهم: {FmtMoney(h.Value)}\n\n";
+                           $"├ 💵 قیمت لحظه‌ای بازار: {FmtPrice(h.Price)}\n" +
+                           $"├ 🎯 نقطه سر به سر شما (با کارمزد): {FmtPrice(h.CostBasis)}\n" +
+                           $"├ 💎 ارزش کل این سهم: {FmtMoney(h.Value)}\n" +
+                           $"└ {pnlIcon} سود/زیان این سهم: {pnlSign}{FmtMoney(h.PnL)} ({pnlSign}{h.PnLPct:N1}%)\n\n";
                 }
                 msg += $"━━━━━━━━━━━━━━━━━━━━━━\n" +
                        $"💡 برای فروش در تابلو P2P یا مشاهده تابلوی معاملاتی هر سهم، روی دکمه مربوطه کلیک کنید:";
@@ -2905,17 +2945,35 @@ namespace StockBotApp
 
                             if (buy.UserId != 0)
                             {
-                                buyer.Balance -= (tradePrice * matchQty) + tax;
+                                decimal batchCost = (tradePrice * matchQty) + tax;
+                                long oldQty = buyer.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                                decimal oldBasis = buyer.CostBasis.TryGetValue(symbol, out var cb) ? cb : tradePrice;
+                                decimal oldTotalInvested = oldQty * oldBasis;
+
+                                long newQty = oldQty + matchQty;
+                                decimal newTotalInvested = oldTotalInvested + batchCost;
+                                if (newQty > 0) buyer.CostBasis[symbol] = newTotalInvested / newQty; // نقطه سر به سر جدید با کارمزد
+
+                                buyer.Balance -= batchCost;
                                 if (!buyer.Portfolio.ContainsKey(symbol)) buyer.Portfolio[symbol] = 0;
-                                buyer.Portfolio[symbol] += matchQty;
+                                buyer.Portfolio[symbol] = newQty;
                             }
 
                             if (sell.UserId != 0)
                             {
-                                seller.Balance += (tradePrice * matchQty) - tax;
+                                decimal netProceeds = (tradePrice * matchQty) - tax;
+                                decimal basisPerUnit = seller.CostBasis.TryGetValue(symbol, out var cb) ? cb : tradePrice;
+                                decimal realizedPnL = netProceeds - (basisPerUnit * matchQty);
+
+                                seller.TotalProfit += realizedPnL;
+                                seller.Balance += netProceeds;
                                 if (!seller.Portfolio.ContainsKey(symbol)) seller.Portfolio[symbol] = 0;
                                 seller.Portfolio[symbol] -= matchQty;
-                                if (seller.Portfolio[symbol] < 0) seller.Portfolio[symbol] = 0;
+                                if (seller.Portfolio[symbol] <= 0)
+                                {
+                                    seller.Portfolio.Remove(symbol);
+                                    seller.CostBasis.Remove(symbol);
+                                }
                             }
 
                             buy.Quantity -= matchQty;
@@ -2946,6 +3004,11 @@ namespace StockBotApp
                             if (buy.UserId != 0 && sell.UserId != 0)
                             {
                                 UpdateUserStats(buyer, seller);
+                                string buyMsg = $"🎉 معامله P2P موفق!\nشما {matchQty:N0} واحد {symbol} را به قیمت واحد {FmtPrice(tradePrice)} از @{seller.Username} خریداری کردید!\n💰 موجودی جدید دلار شما: {FmtMoney(buyer.Balance)}";
+                                string sellMsg = $"🎉 معامله P2P موفق!\nتعداد {matchQty:N0} واحد از سهام {symbol} شما به قیمت واحد {FmtPrice(tradePrice)} توسط @{buyer.Username} خریداری شد!\n💰 مبلغ دریافتی با کسر کارمزد: {FmtMoney((tradePrice * matchQty) * 0.99m)}\n💵 موجودی جدید دلار شما: {FmtMoney(seller.Balance)}";
+
+                                try { _ = Bot.SendMessage(buyer.UserId, buyMsg); } catch { }
+                                try { _ = Bot.SendMessage(seller.UserId, sellMsg); } catch { }
                             }
                         }
                     }
