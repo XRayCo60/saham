@@ -79,6 +79,7 @@ namespace StockBotApp
             public string ReferralCode { get; set; } = "";
             public int Referrals { get; set; } = 0;
             public bool HasUsedReferral { get; set; } = false;
+            public bool IsBanned { get; set; } = false;
         }
 
         private static Dictionary<string, Currency> Market = new();
@@ -209,6 +210,13 @@ namespace StockBotApp
                 altCmd4.ExecuteNonQuery();
             }
             catch { }
+            try
+            {
+                using var altCmd5 = conn.CreateCommand();
+                altCmd5.CommandText = "ALTER TABLE Users ADD COLUMN IsBanned INTEGER DEFAULT 0;";
+                altCmd5.ExecuteNonQuery();
+            }
+            catch { }
             return conn;
         }
 
@@ -257,7 +265,8 @@ namespace StockBotApp
                     CrisisSurvived = u.CrisisSurvived,
                     ReferralCode = u.ReferralCode,
                     Referrals = u.Referrals,
-                    HasUsedReferral = u.HasUsedReferral
+                    HasUsedReferral = u.HasUsedReferral,
+                    IsBanned = u.IsBanned
                 }).ToList();
             }
 
@@ -361,8 +370,8 @@ namespace StockBotApp
                 using var insCmd = conn.CreateCommand();
                 insCmd.Transaction = trans;
                 insCmd.CommandText = @"
-                    INSERT OR REPLACE INTO Users (UserId, Username, Balance, Level, XP, TotalTrades, SuccessfulTrades, TotalProfit, CrisisSurvived, ReferralCode, Referrals, LastDailyReward, PortfolioJson, CostBasisJson, DeviceFingerprintsJson, HasUsedReferral)
-                    VALUES (@uid, @un, @bal, @lvl, @xp, @tt, @st, @tp, @cs, @rc, @ref, @ldr, @port, @cb, @fp, @hur)";
+                    INSERT OR REPLACE INTO Users (UserId, Username, Balance, Level, XP, TotalTrades, SuccessfulTrades, TotalProfit, CrisisSurvived, ReferralCode, Referrals, LastDailyReward, PortfolioJson, CostBasisJson, DeviceFingerprintsJson, HasUsedReferral, IsBanned)
+                    VALUES (@uid, @un, @bal, @lvl, @xp, @tt, @st, @tp, @cs, @rc, @ref, @ldr, @port, @cb, @fp, @hur, @ban)";
                 insCmd.Parameters.AddWithValue("@uid", u.UserId);
                 insCmd.Parameters.AddWithValue("@un", u.Username ?? "unknown");
                 insCmd.Parameters.AddWithValue("@bal", u.Balance);
@@ -379,6 +388,7 @@ namespace StockBotApp
                 insCmd.Parameters.AddWithValue("@cb", JsonConvert.SerializeObject(u.CostBasis));
                 insCmd.Parameters.AddWithValue("@fp", JsonConvert.SerializeObject(u.DeviceFingerprints));
                 insCmd.Parameters.AddWithValue("@hur", u.HasUsedReferral ? 1 : 0);
+                insCmd.Parameters.AddWithValue("@ban", u.IsBanned ? 1 : 0);
                 insCmd.ExecuteNonQuery();
             }
 
@@ -710,7 +720,7 @@ namespace StockBotApp
             // 3. لود کاربران
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText = "SELECT UserId, Username, Balance, Level, XP, TotalTrades, SuccessfulTrades, TotalProfit, CrisisSurvived, ReferralCode, Referrals, LastDailyReward, PortfolioJson, DeviceFingerprintsJson, CostBasisJson, HasUsedReferral FROM Users";
+                cmd.CommandText = "SELECT UserId, Username, Balance, Level, XP, TotalTrades, SuccessfulTrades, TotalProfit, CrisisSurvived, ReferralCode, Referrals, LastDailyReward, PortfolioJson, DeviceFingerprintsJson, CostBasisJson, HasUsedReferral, IsBanned FROM Users";
                 using var reader = cmd.ExecuteReader();
                 while (reader.Read())
                 {
@@ -745,6 +755,11 @@ namespace StockBotApp
                     if (reader.FieldCount > 15 && !reader.IsDBNull(15))
                     {
                         u.HasUsedReferral = reader.GetInt32(15) == 1;
+                    }
+
+                    if (reader.FieldCount > 16 && !reader.IsDBNull(16))
+                    {
+                        u.IsBanned = reader.GetInt32(16) == 1;
                     }
 
                     Users[userId] = u;
@@ -888,6 +903,12 @@ namespace StockBotApp
                     user = u;
                 }
 
+                if (user.IsBanned && userId != OwnerId)
+                {
+                    await bot.SendMessage(chatId, "🚫 دسترسی حساب کاربری شما توسط مدیریت سرور مسدود شده است.", cancellationToken: ct);
+                    return;
+                }
+
                 // مدیریت وضعیت‌های خاص (مانند ارسال عکس، متن یا وارد کردن مقدار دلخواه خرید و فروش)
                 if (UserStates.TryGetValue(chatId, out var state))
                 {
@@ -921,9 +942,9 @@ namespace StockBotApp
                 "🔄 ریست بازار", "🎲 رویداد تصادفی", "📰 رویدادهای ویژه", "رویدادها",
                 "خبر مثبت", "خبر منفی", "هک", "جنگ", "رکود", "رشد ناگهانی", "سقوط آزاد", "بازگشت",
                 "🏆 لیدربورد", "🏆 لیدربورد برترین‌ها", "🔙 بازگشت به منوی اصلی", "پنل", "admin", "👑 پنل مدیریت",
-                "🎁 واریز / مدیریت سهام", "مدیریت سهام"
+                "🎁 واریز / مدیریت سهام", "مدیریت سهام", "🎮 کنترل پنل دارایی پلیر", "کنترل پلیر", "مدیریت پلیر"
             };
-            return ownerCmds.Contains(text) || text.StartsWith("واریز سهام") || text.StartsWith("برداشت سهام") || text.StartsWith("واریز دلار") || text.StartsWith("برداشت دلار");
+            return ownerCmds.Contains(text) || text.StartsWith("واریز سهام") || text.StartsWith("برداشت سهام") || text.StartsWith("واریز دلار") || text.StartsWith("برداشت دلار") || text.StartsWith("کنترل پلیر");
         }
 
         private static async Task<bool> HandleStateAsync(ITelegramBotClient bot, Message message, string state, CancellationToken ct)
@@ -1130,6 +1151,230 @@ namespace StockBotApp
                 if (descSet)
                 {
                     await bot.SendMessage(chatId, $"✅ توضیحات ارز {symbol} با موفقیت به‌روزرسانی شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                    return true;
+                }
+            }
+            else if (state == "ADM_CTRL_SELECT_USER" || state == "ADM_RESET_USER")
+            {
+                var target = FindUserByIdOrUsernameOrRank(text, out _);
+                if (target != null)
+                {
+                    await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, "❌ پلیر مورد نظر یافت نشد.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                }
+                UserStates.Remove(chatId);
+                return true;
+            }
+            else if (state.StartsWith("ADM_CTRL_ADD_CASH_AMT_"))
+            {
+                var targetId = long.Parse(state.Split('_')[5]);
+                if (decimal.TryParse(text, out var amount) && amount > 0)
+                {
+                    User? target = null;
+                    lock (_dataLock)
+                    {
+                        if (Users.TryGetValue(targetId, out var u))
+                        {
+                            u.Balance += amount;
+                            target = u;
+                        }
+                    }
+                    if (target != null)
+                    {
+                        RequestSave();
+                        await bot.SendMessage(chatId, $"✅ مبلغ {FmtMoney(amount)} دلار با موفقیت به موجودی کاربر @{target.Username} اضافه شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        try { _ = Bot.SendMessage(target.UserId, $"🎁 **اعلان مدیریت:** مبلغ {FmtMoney(amount)} از طرف مدیریت به موجودی حساب شما واریز شد."); } catch { }
+                        await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+                    }
+                    UserStates.Remove(chatId);
+                    return true;
+                }
+            }
+            else if (state.StartsWith("ADM_CTRL_SUB_CASH_AMT_"))
+            {
+                var targetId = long.Parse(state.Split('_')[5]);
+                if (decimal.TryParse(text, out var amount) && amount > 0)
+                {
+                    User? target = null;
+                    lock (_dataLock)
+                    {
+                        if (Users.TryGetValue(targetId, out var u))
+                        {
+                            u.Balance = Math.Max(0m, u.Balance - amount);
+                            target = u;
+                        }
+                    }
+                    if (target != null)
+                    {
+                        RequestSave();
+                        await bot.SendMessage(chatId, $"✅ مبلغ {FmtMoney(amount)} دلار با موفقیت از موجودی کاربر @{target.Username} کسر شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+                    }
+                    UserStates.Remove(chatId);
+                    return true;
+                }
+            }
+            else if (state.StartsWith("ADM_CTRL_ADD_STOCK_QTY_"))
+            {
+                var parts = state.Split('_');
+                var targetId = long.Parse(parts[5]);
+                var symbol = parts[6];
+                if (long.TryParse(text, out var qty) && qty > 0)
+                {
+                    User? target = null;
+                    lock (_dataLock)
+                    {
+                        if (Users.TryGetValue(targetId, out var u) && Market.ContainsKey(symbol))
+                        {
+                            if (!u.Portfolio.ContainsKey(symbol)) u.Portfolio[symbol] = 0;
+                            u.Portfolio[symbol] += qty;
+                            target = u;
+                        }
+                    }
+                    if (target != null)
+                    {
+                        RequestSave();
+                        await bot.SendMessage(chatId, $"✅ تعداد {qty:N0} واحد سهام {symbol} با موفقیت به سبد کاربر @{target.Username} واریز شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        try { _ = Bot.SendMessage(target.UserId, $"🎁 **اعلان مدیریت:** تعداد {qty:N0} واحد سهام {symbol} به سبد دارایی شما اضافه شد."); } catch { }
+                        await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+                    }
+                    UserStates.Remove(chatId);
+                    return true;
+                }
+            }
+            else if (state.StartsWith("ADM_CTRL_SUB_STOCK_QTY_"))
+            {
+                var parts = state.Split('_');
+                var targetId = long.Parse(parts[5]);
+                var symbol = parts[6];
+                if (long.TryParse(text, out var qty) && qty > 0)
+                {
+                    User? target = null;
+                    lock (_dataLock)
+                    {
+                        if (Users.TryGetValue(targetId, out var u))
+                        {
+                            long cur = u.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                            if (cur <= qty) u.Portfolio.Remove(symbol);
+                            else u.Portfolio[symbol] = cur - qty;
+                            target = u;
+                        }
+                    }
+                    if (target != null)
+                    {
+                        RequestSave();
+                        await bot.SendMessage(chatId, $"✅ تعداد {qty:N0} واحد سهام {symbol} از سبد کاربر @{target.Username} کسر شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+                    }
+                    UserStates.Remove(chatId);
+                    return true;
+                }
+            }
+            else if (state.StartsWith("ADM_CTRL_ADD_CASH_AMT_"))
+            {
+                var targetId = long.Parse(state.Split('_')[5]);
+                if (decimal.TryParse(text, out var amount) && amount > 0)
+                {
+                    User? target = null;
+                    lock (_dataLock)
+                    {
+                        if (Users.TryGetValue(targetId, out var u))
+                        {
+                            u.Balance += amount;
+                            target = u;
+                        }
+                    }
+                    if (target != null)
+                    {
+                        RequestSave();
+                        await bot.SendMessage(chatId, $"✅ مبلغ {FmtMoney(amount)} دلار با موفقیت به موجودی کاربر @{target.Username} اضافه شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        try { _ = Bot.SendMessage(target.UserId, $"🎁 **اعلان مدیریت:** مبلغ {FmtMoney(amount)} از طرف مدیریت به موجودی حساب شما واریز شد."); } catch { }
+                        await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+                    }
+                    UserStates.Remove(chatId);
+                    return true;
+                }
+            }
+            else if (state.StartsWith("ADM_CTRL_SUB_CASH_AMT_"))
+            {
+                var targetId = long.Parse(state.Split('_')[5]);
+                if (decimal.TryParse(text, out var amount) && amount > 0)
+                {
+                    User? target = null;
+                    lock (_dataLock)
+                    {
+                        if (Users.TryGetValue(targetId, out var u))
+                        {
+                            u.Balance = Math.Max(0m, u.Balance - amount);
+                            target = u;
+                        }
+                    }
+                    if (target != null)
+                    {
+                        RequestSave();
+                        await bot.SendMessage(chatId, $"✅ مبلغ {FmtMoney(amount)} دلار با موفقیت از موجودی کاربر @{target.Username} کسر شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+                    }
+                    UserStates.Remove(chatId);
+                    return true;
+                }
+            }
+            else if (state.StartsWith("ADM_CTRL_ADD_STOCK_QTY_"))
+            {
+                var parts = state.Split('_');
+                var targetId = long.Parse(parts[5]);
+                var symbol = parts[6];
+                if (long.TryParse(text, out var qty) && qty > 0)
+                {
+                    User? target = null;
+                    lock (_dataLock)
+                    {
+                        if (Users.TryGetValue(targetId, out var u) && Market.ContainsKey(symbol))
+                        {
+                            if (!u.Portfolio.ContainsKey(symbol)) u.Portfolio[symbol] = 0;
+                            u.Portfolio[symbol] += qty;
+                            target = u;
+                        }
+                    }
+                    if (target != null)
+                    {
+                        RequestSave();
+                        await bot.SendMessage(chatId, $"✅ تعداد {qty:N0} واحد سهام {symbol} با موفقیت به سبد کاربر @{target.Username} واریز شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        try { _ = Bot.SendMessage(target.UserId, $"🎁 **اعلان مدیریت:** تعداد {qty:N0} واحد سهام {symbol} به سبد دارایی شما اضافه شد."); } catch { }
+                        await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+                    }
+                    UserStates.Remove(chatId);
+                    return true;
+                }
+            }
+            else if (state.StartsWith("ADM_CTRL_SUB_STOCK_QTY_"))
+            {
+                var parts = state.Split('_');
+                var targetId = long.Parse(parts[5]);
+                var symbol = parts[6];
+                if (long.TryParse(text, out var qty) && qty > 0)
+                {
+                    User? target = null;
+                    lock (_dataLock)
+                    {
+                        if (Users.TryGetValue(targetId, out var u))
+                        {
+                            long cur = u.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                            if (cur <= qty) u.Portfolio.Remove(symbol);
+                            else u.Portfolio[symbol] = cur - qty;
+                            target = u;
+                        }
+                    }
+                    if (target != null)
+                    {
+                        RequestSave();
+                        await bot.SendMessage(chatId, $"✅ تعداد {qty:N0} واحد سهام {symbol} از سبد کاربر @{target.Username} کسر شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+                    }
+                    UserStates.Remove(chatId);
                     return true;
                 }
             }
@@ -1365,6 +1610,160 @@ namespace StockBotApp
             }
 
             return false;
+        }
+
+        private static User? FindUserByIdOrUsernameOrRank(string input, out int rank)
+        {
+            rank = 0;
+            input = input.Trim();
+            if (string.IsNullOrWhiteSpace(input)) return null;
+
+            string rankStr = input.TrimStart('#').Replace("رتبه", "").Replace("rank", "").Trim();
+            if (int.TryParse(rankStr, out var r) && r >= 1 && r <= 100)
+            {
+                List<User> leaderboard;
+                lock (_dataLock)
+                {
+                    leaderboard = Users.Values
+                        .Where(u => u.UserId != 0)
+                        .OrderByDescending(u => u.Balance + u.Portfolio.Sum(p => p.Value * GetCurrentPrice(p.Key)))
+                        .ToList();
+                }
+                if (r <= leaderboard.Count)
+                {
+                    rank = r;
+                    return leaderboard[r - 1];
+                }
+            }
+
+            string idStr = input.TrimStart('@');
+            if (long.TryParse(idStr, out var uid))
+            {
+                lock (_dataLock)
+                {
+                    if (Users.TryGetValue(uid, out var userById))
+                    {
+                        var lb = Users.Values
+                            .Where(u => u.UserId != 0)
+                            .OrderByDescending(u => u.Balance + u.Portfolio.Sum(p => p.Value * GetCurrentPrice(p.Key)))
+                            .ToList();
+                        int idx = lb.FindIndex(u => u.UserId == uid);
+                        if (idx >= 0) rank = idx + 1;
+                        return userById;
+                    }
+                }
+            }
+
+            lock (_dataLock)
+            {
+                var userByUn = Users.Values.FirstOrDefault(u => string.Equals(u.Username, idStr, StringComparison.OrdinalIgnoreCase));
+                if (userByUn != null)
+                {
+                    var lb = Users.Values
+                        .Where(u => u.UserId != 0)
+                        .OrderByDescending(u => u.Balance + u.Portfolio.Sum(p => p.Value * GetCurrentPrice(p.Key)))
+                        .ToList();
+                    int idx = lb.FindIndex(u => u.UserId == userByUn.UserId);
+                    if (idx >= 0) rank = idx + 1;
+                    return userByUn;
+                }
+            }
+
+            return null;
+        }
+
+        private static User? FindUserByIdOrUsername(string input)
+        {
+            return FindUserByIdOrUsernameOrRank(input, out _);
+        }
+
+        private static async Task SendPlayerGodModeDashboardAsync(ITelegramBotClient bot, long chatId, User target, CancellationToken ct)
+        {
+            int rank = 0;
+            decimal netWorth = 0m;
+            decimal totalStockVal = 0m;
+
+            lock (_dataLock)
+            {
+                var leaderboard = Users.Values
+                    .Where(u => u.UserId != 0)
+                    .OrderByDescending(u => u.Balance + u.Portfolio.Sum(p => p.Value * GetCurrentPrice(p.Key)))
+                    .ToList();
+                int idx = leaderboard.FindIndex(u => u.UserId == target.UserId);
+                if (idx >= 0) rank = idx + 1;
+
+                foreach (var p in target.Portfolio)
+                {
+                    totalStockVal += p.Value * GetCurrentPrice(p.Key);
+                }
+                netWorth = target.Balance + totalStockVal;
+            }
+
+            string rankStr = rank > 0 ? $"#{rank}" : "نامشخص";
+            string banStr = target.IsBanned ? "🚫 مسدود (Banned)" : "🟢 فعال (Active)";
+            string refStr = target.HasUsedReferral ? "استفاده‌شده" : "آزاد";
+
+            string msg = $"👑 **کنترل پنل پیشرفته دارایی پلیر (God-Mode Dashboard)**\n" +
+                         $"━━━ @{target.Username} ━━━\n\n" +
+                         $"🆔 آیدی عددی: `{target.UserId}` | 🏆 رتبه لیدربورد: **{rankStr}**\n" +
+                         $"🛡 وضعیت حساب: **{banStr}**\n\n" +
+                         $"💵 موجودی نقدی دلار (Cash): **{FmtMoney(target.Balance)}**\n" +
+                         $"💎 ارزش کل سهام‌ها (Stock Value): **{FmtMoney(totalStockVal)}**\n" +
+                         $"🏆 ارزش کل دارایی حساب (Net Worth): **{FmtMoney(netWorth)}**\n\n" +
+                         $"📈 سطح کاربری: Level {target.Level} (XP: {target.XP})\n" +
+                         $"🔄 تعداد معاملات: {target.TotalTrades} (سود کل محقق‌شده: {FmtMoney(target.TotalProfit)})\n" +
+                         $"🎁 وضعیت کد دعوت: {refStr} (تعداد دعوت‌ها: {target.Referrals} نفر)\n\n" +
+                         $"━━━━━━━━━━━━━━━━━━━━━━\n" +
+                         $"📦 **سبد سهام فعلی کاربر:**\n";
+
+            if (target.Portfolio.Count == 0 || target.Portfolio.All(p => p.Value <= 0))
+            {
+                msg += "• *(سبد سهام خالی است)*\n";
+            }
+            else
+            {
+                lock (_dataLock)
+                {
+                    foreach (var p in target.Portfolio.Where(x => x.Value > 0))
+                    {
+                        decimal curPrice = GetCurrentPrice(p.Key);
+                        msg += $"🔸 **{p.Key}:** {p.Value:N0} واحد (ارزش: {FmtMoney(p.Value * curPrice)})\n";
+                    }
+                }
+            }
+
+            msg += $"━━━━━━━━━━━━━━━━━━━━━━\n" +
+                   $"💡 **عملیات دستکاری مورد نظر را انتخاب کنید:**";
+
+            var kb = new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("💵 واریز دلار (+)", $"ADM_CTRL_ADD_CASH_{target.UserId}"),
+                    InlineKeyboardButton.WithCallbackData("💸 کسر دلار (-)", $"ADM_CTRL_SUB_CASH_{target.UserId}")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("📦 واریز سهام (Stock +)", $"ADM_CTRL_ADD_STOCK_{target.UserId}"),
+                    InlineKeyboardButton.WithCallbackData("🗑 کسر سهام (Stock -)", $"ADM_CTRL_SUB_STOCK_{target.UserId}")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("🔄 ریست کامل حساب (Reset)", $"ADM_CTRL_RESET_{target.UserId}"),
+                    InlineKeyboardButton.WithCallbackData("🧹 حذف تمام سهام‌ها (Clear)", $"ADM_CTRL_CLEAR_STOCK_{target.UserId}")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData(target.IsBanned ? "🟢 آزادسازی حساب (Unban)" : "🚫 مسدودسازی (Ban)", $"ADM_CTRL_BAN_{target.UserId}"),
+                    InlineKeyboardButton.WithCallbackData("⚡ اهدای لول/XP (Boost)", $"ADM_CTRL_BOOST_{target.UserId}")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("🔄 به‌روزرسانی پنل پلیر", $"ADM_CTRL_REFRESH_{target.UserId}")
+                }
+            });
+
+            await bot.SendMessage(chatId, msg, parseMode: ParseMode.Markdown, replyMarkup: kb, cancellationToken: ct);
         }
 
         private static User? FindUserByIdOrUsername(string input)
@@ -1713,6 +2112,54 @@ namespace StockBotApp
             else if (text == "🏆 لیدربورد" || text == "🏆 لیدربورد برترین‌ها")
             {
                 await SendLeaderboardAsync(bot, chatId, OwnerId, ct);
+            }
+            else if (text == "🎮 کنترل پنل دارایی پلیر" || text == "کنترل پلیر" || text == "مدیریت پلیر")
+            {
+                UserStates[chatId] = "ADM_CTRL_SELECT_USER";
+                string info = "🎮 **کنترل پنل پیشرفته دارایی پلیر (God-Mode Player Control):**\n\n" +
+                              "لطفاً پلیر مورد نظر را با یکی از ۳ روش زیر ارسال کنید:\n" +
+                              "۱. 🔢 آیدی عددی (UserId): مثال: `8248899977`\n" +
+                              "۲. 🏆 رتبه لیدربورد (Rank): مثال: `#1` یا `1` (نفر اول لیدربورد)\n" +
+                              "۳. 👤 یوزرنیم تلگرام: مثال: `@username`\n\n" +
+                              "💡 همچنین می‌توانید از دستور یک‌خطی استفاده کنید: `کنترل پلیر #1` یا `کنترل پلیر 8248899977`";
+
+                var kbRows = new List<InlineKeyboardButton[]>();
+                List<User> top3;
+                lock (_dataLock)
+                {
+                    top3 = Users.Values
+                        .Where(u => u.UserId != 0)
+                        .OrderByDescending(u => u.Balance + u.Portfolio.Sum(p => p.Value * GetCurrentPrice(p.Key)))
+                        .Take(3)
+                        .ToList();
+                }
+                var btnRow = new List<InlineKeyboardButton>();
+                for (int i = 0; i < top3.Count; i++)
+                {
+                    string rIcon = i == 0 ? "🥇" : (i == 1 ? "🥈" : "🥉");
+                    btnRow.Add(InlineKeyboardButton.WithCallbackData($"{rIcon} رتبه #{i + 1}", $"ADM_CTRL_SELECT_{top3[i].UserId}"));
+                }
+                if (btnRow.Count > 0) kbRows.Add(btnRow.ToArray());
+                kbRows.Add(new[] { InlineKeyboardButton.WithCallbackData("❌ انصراف", "ADM_CANCEL") });
+
+                await bot.SendMessage(chatId, info, parseMode: ParseMode.Markdown, replyMarkup: new InlineKeyboardMarkup(kbRows), cancellationToken: ct);
+            }
+            else if (text.StartsWith("کنترل پلیر"))
+            {
+                var parts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 3)
+                {
+                    var targetInput = parts[2];
+                    User? target = FindUserByIdOrUsernameOrRank(targetInput, out _);
+                    if (target != null)
+                    {
+                        await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+                    }
+                    else
+                    {
+                        await bot.SendMessage(chatId, "❌ کاربر مورد نظر یافت نشد.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                    }
+                }
             }
             else if (text == "🔙 بازگشت به منوی اصلی")
             {
@@ -2368,6 +2815,186 @@ namespace StockBotApp
             else if (data == "VIEW_MARKET")
             {
                 await SendMarketOverviewAsync(bot, chatId, ct);
+            }
+            else if (data.StartsWith("ADM_CTRL_SELECT_"))
+            {
+                if (userId != OwnerId) return;
+                var targetId = long.Parse(data.Split('_')[3]);
+                User? target = null;
+                lock (_dataLock) { Users.TryGetValue(targetId, out target); }
+                if (target != null) await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+            }
+            else if (data.StartsWith("ADM_CTRL_ADD_CASH_"))
+            {
+                if (userId != OwnerId) return;
+                var targetId = data.Split('_')[4];
+                UserStates[chatId] = $"ADM_CTRL_ADD_CASH_AMT_{targetId}";
+                await bot.SendMessage(chatId, "💵 چه مقدار دلار ($) می‌خواهید به موجودی کاربر اضافه کنید؟ (مثال: 50000):", cancellationToken: ct);
+            }
+            else if (data.StartsWith("ADM_CTRL_SUB_CASH_"))
+            {
+                if (userId != OwnerId) return;
+                var targetId = data.Split('_')[4];
+                UserStates[chatId] = $"ADM_CTRL_SUB_CASH_AMT_{targetId}";
+                await bot.SendMessage(chatId, "💸 چه مقدار دلار ($) می‌خواهید از موجودی کاربر کسر کنید؟ (مثال: 5000):", cancellationToken: ct);
+            }
+            else if (data.StartsWith("ADM_CTRL_ADD_STOCK_"))
+            {
+                if (userId != OwnerId) return;
+                var targetId = data.Split('_')[4];
+                var rows = new List<InlineKeyboardButton[]>();
+                lock (_dataLock)
+                {
+                    foreach (var sym in Market.Keys)
+                    {
+                        rows.Add(new[] { InlineKeyboardButton.WithCallbackData($"📦 واریز {sym}", $"ADM_CTRL_ADD_SYM_{targetId}_{sym}") });
+                    }
+                }
+                await bot.SendMessage(chatId, "📦 ارزی که می‌خواهید به سبد کاربر واریز کنید را انتخاب کنید:", replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
+            }
+            else if (data.StartsWith("ADM_CTRL_ADD_SYM_"))
+            {
+                if (userId != OwnerId) return;
+                var parts = data.Split('_');
+                var targetId = parts[4];
+                var symbol = parts[5];
+                UserStates[chatId] = $"ADM_CTRL_ADD_STOCK_QTY_{targetId}_{symbol}";
+                await bot.SendMessage(chatId, $"📦 چه تعداد واحد سهام {symbol} می‌خواهید به کاربر واریز کنید؟ (مثال: 1000):", cancellationToken: ct);
+            }
+            else if (data.StartsWith("ADM_CTRL_SUB_STOCK_"))
+            {
+                if (userId != OwnerId) return;
+                var targetId = long.Parse(data.Split('_')[4]);
+                var rows = new List<InlineKeyboardButton[]>();
+                lock (_dataLock)
+                {
+                    if (Users.TryGetValue(targetId, out var u))
+                    {
+                        foreach (var p in u.Portfolio.Where(x => x.Value > 0))
+                        {
+                            rows.Add(new[] { InlineKeyboardButton.WithCallbackData($"🗑 کسر {p.Key} (موجودی: {p.Value:N0})", $"ADM_CTRL_SUB_SYM_{targetId}_{p.Key}") });
+                        }
+                    }
+                }
+                if (rows.Count == 0)
+                {
+                    await bot.SendMessage(chatId, "🔹 سبد سهام این کاربر خالی است.", cancellationToken: ct);
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, "🗑 سهامی که می‌خواهید از کاربر کسر کنید را انتخاب کنید:", replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
+                }
+            }
+            else if (data.StartsWith("ADM_CTRL_SUB_SYM_"))
+            {
+                if (userId != OwnerId) return;
+                var parts = data.Split('_');
+                var targetId = parts[4];
+                var symbol = parts[5];
+                UserStates[chatId] = $"ADM_CTRL_SUB_STOCK_QTY_{targetId}_{symbol}";
+                await bot.SendMessage(chatId, $"🗑 چه تعداد واحد سهام {symbol} می‌خواهید از کاربر کسر کنید؟:", cancellationToken: ct);
+            }
+            else if (data.StartsWith("ADM_CTRL_RESET_"))
+            {
+                if (userId != OwnerId) return;
+                var targetId = long.Parse(data.Split('_')[3]);
+                User? target = null;
+                lock (_dataLock)
+                {
+                    if (Users.TryGetValue(targetId, out var u))
+                    {
+                        u.Balance = 5000m;
+                        u.Portfolio.Clear();
+                        u.CostBasis.Clear();
+                        u.TotalProfit = 0m;
+                        u.TotalTrades = 0;
+                        u.SuccessfulTrades = 0;
+                        u.XP = 0;
+                        u.Level = 1;
+                        foreach (var c in Market.Values) c.Orders.RemoveAll(o => o.UserId == targetId);
+                        target = u;
+                    }
+                }
+                if (target != null)
+                {
+                    RequestSave();
+                    await bot.SendMessage(chatId, $"✅ حساب کاربری @{target.Username} به طور کامل ریست شد!", cancellationToken: ct);
+                    await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+                }
+            }
+            else if (data.StartsWith("ADM_CTRL_CLEAR_STOCK_"))
+            {
+                if (userId != OwnerId) return;
+                var targetId = long.Parse(data.Split('_')[4]);
+                User? target = null;
+                lock (_dataLock)
+                {
+                    if (Users.TryGetValue(targetId, out var u))
+                    {
+                        u.Portfolio.Clear();
+                        u.CostBasis.Clear();
+                        foreach (var c in Market.Values) c.Orders.RemoveAll(o => o.UserId == targetId && o.Type == "SELL");
+                        target = u;
+                    }
+                }
+                if (target != null)
+                {
+                    RequestSave();
+                    await bot.SendMessage(chatId, $"✅ تمام سهام‌های سبد کاربر @{target.Username} پاک شد!", cancellationToken: ct);
+                    await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+                }
+            }
+            else if (data.StartsWith("ADM_CTRL_BAN_"))
+            {
+                if (userId != OwnerId) return;
+                var targetId = long.Parse(data.Split('_')[3]);
+                User? target = null;
+                lock (_dataLock)
+                {
+                    if (Users.TryGetValue(targetId, out var u))
+                    {
+                        u.IsBanned = !u.IsBanned;
+                        target = u;
+                    }
+                }
+                if (target != null)
+                {
+                    RequestSave();
+                    await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+                }
+            }
+            else if (data.StartsWith("ADM_CTRL_BOOST_"))
+            {
+                if (userId != OwnerId) return;
+                var targetId = long.Parse(data.Split('_')[3]);
+                User? target = null;
+                lock (_dataLock)
+                {
+                    if (Users.TryGetValue(targetId, out var u))
+                    {
+                        u.XP += 1000;
+                        u.Level += 2;
+                        target = u;
+                    }
+                }
+                if (target != null)
+                {
+                    RequestSave();
+                    await bot.SendMessage(chatId, $"⚡ تعداد +1000 XP و +2 Level به کاربر @{target.Username} اهدا شد!", cancellationToken: ct);
+                    await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+                }
+            }
+            else if (data.StartsWith("ADM_CTRL_REFRESH_"))
+            {
+                if (userId != OwnerId) return;
+                var targetId = long.Parse(data.Split('_')[3]);
+                User? target = null;
+                lock (_dataLock) { Users.TryGetValue(targetId, out target); }
+                if (target != null) await SendPlayerGodModeDashboardAsync(bot, chatId, target, ct);
+            }
+            else if (data == "ADM_CANCEL")
+            {
+                await bot.SendMessage(chatId, "❌ عملیات انصراف شد.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
             }
         }
 
@@ -3076,10 +3703,11 @@ namespace StockBotApp
             return new ReplyKeyboardMarkup(new[]
             {
                 new KeyboardButton[] { "➕ اضافه کردن ارز", "📊 مرور بازار", "💰 موجودی کاربران" },
-                new KeyboardButton[] { "🎁 واریز / مدیریت سهام", "🏦 تزریق نقدینگی", "🖼 تنظیم عکس ارز" },
-                new KeyboardButton[] { "📝 تنظیم توضیحات ارز", "🗑 حذف ارز", "📈 تنظیم قیمت دستی" },
-                new KeyboardButton[] { "📋 سفارشات باز", "🔄 ریست بازار", "🎲 رویداد تصادفی" },
-                new KeyboardButton[] { "📰 رویدادهای ویژه", "🏆 لیدربورد", "🔙 بازگشت به منوی اصلی" }
+                new KeyboardButton[] { "🎮 کنترل پنل دارایی پلیر", "🎁 واریز / مدیریت سهام", "🔄 ریست دارایی کاربر" },
+                new KeyboardButton[] { "🏦 تزریق نقدینگی", "🖼 تنظیم عکس ارز", "📝 تنظیم توضیحات ارز" },
+                new KeyboardButton[] { "🗑 حذف ارز", "📈 تنظیم قیمت دستی", "📋 سفارشات باز" },
+                new KeyboardButton[] { "🔄 ریست بازار", "🎲 رویداد تصادفی", "📰 رویدادهای ویژه" },
+                new KeyboardButton[] { "🏆 لیدربورد", "🔙 بازگشت به منوی اصلی" }
             }) { ResizeKeyboard = true };
         }
 
