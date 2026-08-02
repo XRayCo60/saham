@@ -1269,9 +1269,8 @@ namespace StockBotApp
                         if (Market.TryGetValue(symbol, out var c))
                         {
                             var user = Users[message.From!.Id];
-                            if (user.Balance >= totalCost)
+                            if (GetAvailableCash(user) >= totalCost)
                             {
-                                user.Balance -= totalCost; // مسدودسازی موقت وجه برای صف خرید
                                 c.Orders.Add(new Order { UserId = user.UserId, Type = "BUY", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow });
                                 MatchOrders(symbol, user.UserId);
                                 placed = true;
@@ -1331,10 +1330,9 @@ namespace StockBotApp
                         if (Market.TryGetValue(symbol, out var c))
                         {
                             var user = Users[message.From!.Id];
-                            hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                            hasStock = GetAvailableStock(user, symbol);
                             if (hasStock >= qty)
                             {
-                                user.Portfolio[symbol] -= qty; // مسدودسازی موقت سهام برای صف فروش
                                 c.Orders.Add(new Order { UserId = user.UserId, Type = "SELL", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow });
                                 MatchOrders(symbol, user.UserId);
                                 placed = true;
@@ -2092,15 +2090,6 @@ namespace StockBotApp
                             var o = c.Orders.FirstOrDefault(x => x.UserId == userId && x.Timestamp.Ticks == orderId);
                             if (o != null)
                             {
-                                if (o.Type == "BUY")
-                                {
-                                    user.Balance += (o.Price * o.Quantity) * 1.01m; // بازگشت مبلغ مسدودشده
-                                }
-                                else if (o.Type == "SELL")
-                                {
-                                    if (!user.Portfolio.ContainsKey(symbol)) user.Portfolio[symbol] = 0;
-                                    user.Portfolio[symbol] += o.Quantity; // بازگشت سهام مسدودشده
-                                }
                                 c.Orders.Remove(o);
                                 cancelled = true;
                             }
@@ -2262,7 +2251,7 @@ namespace StockBotApp
                         {
                             price = GetCurrentPrice(symbol);
                             totalCost = price * qty * 1.01m;
-                            if (user.Balance >= totalCost)
+                            if (GetAvailableCash(user) >= totalCost)
                             {
                                 canBuy = true;
                                 var order = new Order { UserId = userId, Type = "BUY", Price = price, Quantity = qty, Timestamp = DateTime.UtcNow };
@@ -2274,7 +2263,7 @@ namespace StockBotApp
 
                     if (!canBuy)
                     {
-                        await bot.SendMessage(chatId, $"❌ موجودی نقدی دلار شما کافی نیست.\nمبلغ مورد نیاز با کارمزد: {FmtMoney(totalCost)}\nموجودی شما: {FmtMoney(user.Balance)}", cancellationToken: ct);
+                        await bot.SendMessage(chatId, $"❌ موجودی نقدی دلار آزاد شما کافی نیست.\nمبلغ مورد نیاز با کارمزد: {FmtMoney(totalCost)}\nموجودی آزاد شما: {FmtMoney(GetAvailableCash(user))}", cancellationToken: ct);
                         return;
                     }
 
@@ -2300,7 +2289,7 @@ namespace StockBotApp
                     {
                         if (Market.TryGetValue(symbol, out var c))
                         {
-                            hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                            hasStock = GetAvailableStock(user, symbol);
                             if (hasStock >= qty)
                             {
                                 canSell = true;
@@ -2314,7 +2303,7 @@ namespace StockBotApp
 
                     if (!canSell)
                     {
-                        await bot.SendMessage(chatId, $"❌ موجودی سهام {symbol} شما کافی نیست. موجودی شما: {hasStock:N0} واحد", cancellationToken: ct);
+                        await bot.SendMessage(chatId, $"❌ موجودی سهام آزاد {symbol} شما کافی نیست. موجودی آزاد شما: {hasStock:N0} واحد", cancellationToken: ct);
                         return;
                     }
 
@@ -2337,7 +2326,7 @@ namespace StockBotApp
                 {
                     if (Market.TryGetValue(symbol, out var c))
                     {
-                        hasStock = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+                        hasStock = GetAvailableStock(user, symbol);
                         if (hasStock > 0)
                         {
                             canSell = true;
@@ -2351,7 +2340,7 @@ namespace StockBotApp
 
                 if (!canSell)
                 {
-                    await bot.SendMessage(chatId, $"❌ شما هیچ موجودی از ارز {symbol} برای فروش ندارید.", cancellationToken: ct);
+                    await bot.SendMessage(chatId, $"❌ شما هیچ موجودی سهام آزاد از ارز {symbol} برای فروش ندارید.", cancellationToken: ct);
                     return;
                 }
 
