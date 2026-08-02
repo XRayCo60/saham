@@ -121,6 +121,28 @@ namespace StockBotApp
             }
         }
 
+        private static long GetAvailableStock(User user, string symbol)
+        {
+            long total = user.Portfolio.TryGetValue(symbol, out var sq) ? sq : 0;
+            long reserved = 0;
+            if (Market.TryGetValue(symbol, out var c))
+            {
+                reserved = c.Orders.Where(o => o.UserId == user.UserId && o.Type == "SELL").Sum(o => o.Quantity);
+            }
+            return Math.Max(0, total - reserved);
+        }
+
+        private static decimal GetAvailableCash(User user)
+        {
+            decimal total = user.Balance;
+            decimal reserved = 0m;
+            foreach (var c in Market.Values)
+            {
+                reserved += c.Orders.Where(o => o.UserId == user.UserId && o.Type == "BUY").Sum(o => (o.Price * o.Quantity) * 1.01m);
+            }
+            return Math.Max(0m, total - reserved);
+        }
+
         private static void RequestSave()
         {
             _saveRequested = true;
@@ -1764,16 +1786,6 @@ namespace StockBotApp
             });
 
             await bot.SendMessage(chatId, msg, parseMode: ParseMode.Markdown, replyMarkup: kb, cancellationToken: ct);
-        }
-
-        private static User? FindUserByIdOrUsername(string input)
-        {
-            input = input.Trim().TrimStart('@');
-            if (long.TryParse(input, out var uid) && Users.TryGetValue(uid, out var userById))
-            {
-                return userById;
-            }
-            return Users.Values.FirstOrDefault(u => string.Equals(u.Username, input, StringComparison.OrdinalIgnoreCase));
         }
 
         // ===================== OWNER PANEL =====================
