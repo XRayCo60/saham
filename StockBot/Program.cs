@@ -42,6 +42,7 @@ namespace StockBotApp
             public long CirculatingSupply { get; set; }
             public string PhotoUrl { get; set; } = "";
             public string Description { get; set; } = "";
+            public bool IsHalted { get; set; } = false;
             public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
             public List<Order> Orders { get; set; } = new();
             public List<decimal> PriceHistory { get; set; } = new();
@@ -239,6 +240,13 @@ namespace StockBotApp
                 altCmd5.ExecuteNonQuery();
             }
             catch { }
+            try
+            {
+                using var altCmd6 = conn.CreateCommand();
+                altCmd6.CommandText = "ALTER TABLE Currencies ADD COLUMN IsHalted INTEGER DEFAULT 0;";
+                altCmd6.ExecuteNonQuery();
+            }
+            catch { }
             return conn;
         }
 
@@ -257,6 +265,7 @@ namespace StockBotApp
                     TotalSupply = c.TotalSupply,
                     CirculatingSupply = c.CirculatingSupply,
                     PhotoUrl = c.PhotoUrl,
+                    IsHalted = c.IsHalted,
                     CreatedAt = c.CreatedAt,
                     PriceHistory = new List<decimal>(c.PriceHistory),
                     TimedPriceHistory = new List<PricePoint>(c.TimedPriceHistory),
@@ -340,8 +349,8 @@ namespace StockBotApp
                 using var insCmd = conn.CreateCommand();
                 insCmd.Transaction = trans;
                 insCmd.CommandText = @"
-                    INSERT OR REPLACE INTO Currencies (Symbol, Description, BaseValue, TotalSupply, CirculatingSupply, PhotoUrl, PriceHistoryJson, CreatedAt, TimedPriceHistoryJson)
-                    VALUES (@s, @d, @bv, @ts, @cs, @pu, @ph, @ca, @tph)";
+                    INSERT OR REPLACE INTO Currencies (Symbol, Description, BaseValue, TotalSupply, CirculatingSupply, PhotoUrl, PriceHistoryJson, CreatedAt, TimedPriceHistoryJson, IsHalted)
+                    VALUES (@s, @d, @bv, @ts, @cs, @pu, @ph, @ca, @tph, @ih)";
                 insCmd.Parameters.AddWithValue("@s", c.Symbol);
                 insCmd.Parameters.AddWithValue("@d", c.Description ?? c.Symbol);
                 insCmd.Parameters.AddWithValue("@bv", c.BaseValue);
@@ -351,6 +360,7 @@ namespace StockBotApp
                 insCmd.Parameters.AddWithValue("@ph", JsonConvert.SerializeObject(c.PriceHistory));
                 insCmd.Parameters.AddWithValue("@ca", c.CreatedAt.ToString("o"));
                 insCmd.Parameters.AddWithValue("@tph", JsonConvert.SerializeObject(c.TimedPriceHistory));
+                insCmd.Parameters.AddWithValue("@ih", c.IsHalted ? 1 : 0);
                 insCmd.ExecuteNonQuery();
             }
 
@@ -670,7 +680,7 @@ namespace StockBotApp
             // 1. لود ارزها
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText = "SELECT Symbol, Description, BaseValue, TotalSupply, CirculatingSupply, PhotoUrl, PriceHistoryJson, CreatedAt, TimedPriceHistoryJson FROM Currencies";
+                cmd.CommandText = "SELECT Symbol, Description, BaseValue, TotalSupply, CirculatingSupply, PhotoUrl, PriceHistoryJson, CreatedAt, TimedPriceHistoryJson, IsHalted FROM Currencies";
                 using var reader = cmd.ExecuteReader();
                 while (reader.Read())
                 {
@@ -699,6 +709,11 @@ namespace StockBotApp
                     {
                         var tphJson = reader.GetString(8);
                         c.TimedPriceHistory = JsonConvert.DeserializeObject<List<PricePoint>>(tphJson) ?? new();
+                    }
+
+                    if (reader.FieldCount > 9 && !reader.IsDBNull(9))
+                    {
+                        c.IsHalted = reader.GetInt32(9) == 1;
                     }
 
                     if (c.TimedPriceHistory == null || c.TimedPriceHistory.Count == 0)
@@ -964,9 +979,10 @@ namespace StockBotApp
                 "🔄 ریست بازار", "🎲 رویداد تصادفی", "📰 رویدادهای ویژه", "رویدادها",
                 "خبر مثبت", "خبر منفی", "هک", "جنگ", "رکود", "رشد ناگهانی", "سقوط آزاد", "بازگشت",
                 "🏆 لیدربورد", "🏆 لیدربورد برترین‌ها", "🔙 بازگشت به منوی اصلی", "پنل", "admin", "👑 پنل مدیریت",
-                "🎁 واریز / مدیریت سهام", "مدیریت سهام", "🎮 کنترل پنل دارایی پلیر", "کنترل پلیر", "مدیریت پلیر"
+                "🎁 واریز / مدیریت سهام", "مدیریت سهام", "🎮 کنترل پنل دارایی پلیر", "کنترل پلیر", "مدیریت پلیر",
+                "⚖️ جریمه مالی کاربر (Fine)", "جریمه کاربر", "🔒 توقف / بازگشایی نماد", "توقف نماد", "بازگشایی نماد"
             };
-            return ownerCmds.Contains(text) || text.StartsWith("واریز سهام") || text.StartsWith("برداشت سهام") || text.StartsWith("واریز دلار") || text.StartsWith("برداشت دلار") || text.StartsWith("کنترل پلیر");
+            return ownerCmds.Contains(text) || text.StartsWith("واریز سهام") || text.StartsWith("برداشت سهام") || text.StartsWith("واریز دلار") || text.StartsWith("برداشت دلار") || text.StartsWith("کنترل پلیر") || text.StartsWith("جریمه کاربر") || text.StartsWith("توقف نماد") || text.StartsWith("بازگشایی نماد");
         }
 
         private static async Task<bool> HandleStateAsync(ITelegramBotClient bot, Message message, string state, CancellationToken ct)
@@ -1996,6 +2012,80 @@ namespace StockBotApp
             {
                 UserStates[chatId] = "REMOVE_CURRENCY";
                 await bot.SendMessage(chatId, "نماد ارزی که می‌خواهید حذف کنید را وارد کنید:", cancellationToken: ct);
+            }
+            else if (text == "🔒 توقف / بازگشایی نماد" || text == "توقف نماد" || text == "بازگشایی نماد")
+            {
+                UserStates[chatId] = "ADM_TOGGLE_HALT";
+                string info = "🔒 **توقف یا بازگشایی معاملات نماد (Halt / Unhalt Trading):**\n\n" +
+                              "لطفاً نماد ارز مورد نظر را وارد کنید (مثال: `NOM` یا `BTC`).\n" +
+                              "*(اگر نماد فعال باشد متوقف می‌شود، و اگر متوقف باشد بازگشایی می‌شود)*\n\n" +
+                              "💡 دستور سریع یک‌خطی: `توقف نماد NOM` یا `بازگشایی نماد BTC`";
+                await bot.SendMessage(chatId, info, parseMode: ParseMode.Markdown, cancellationToken: ct);
+            }
+            else if (text.StartsWith("توقف نماد ") || text.StartsWith("بازگشایی نماد "))
+            {
+                var parts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 3)
+                {
+                    var symbol = parts[2].ToUpper();
+                    bool success = false;
+                    bool haltedNow = false;
+                    lock (_dataLock)
+                    {
+                        if (Market.TryGetValue(symbol, out var c))
+                        {
+                            c.IsHalted = text.StartsWith("توقف نماد");
+                            haltedNow = c.IsHalted;
+                            success = true;
+                        }
+                    }
+                    if (success)
+                    {
+                        RequestSave();
+                        string status = haltedNow ? "🔒 متوقف (Halted)" : "🟢 فعال (Active)";
+                        await bot.SendMessage(chatId, $"✅ وضعیت معاملات نماد {symbol} به «{status}» تغییر یافت.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                    }
+                    else
+                    {
+                        await bot.SendMessage(chatId, $"❌ نماد {symbol} یافت نشد.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                    }
+                }
+            }
+            else if (text == "⚖️ جریمه مالی کاربر (Fine)" || text == "جریمه کاربر")
+            {
+                UserStates[chatId] = "ADM_FINE_USER_SELECT";
+                string info = "⚖️ **سیستم دادگاه و جریمه مالی کاربر (Fine System):**\n\n" +
+                              "لطفاً آیدی عددی (UserId)، یوزرنیم یا رتبه لیدربورد کاربر مورد نظر را ارسال کنید.\n\n" +
+                              "💡 دستور سریع یک‌خطی: `جریمه کاربر #1 2500 دستکاری بازار` یا `جریمه کاربر @username 1000 تخلف`";
+                await bot.SendMessage(chatId, info, parseMode: ParseMode.Markdown, cancellationToken: ct);
+            }
+            else if (text.StartsWith("جریمه کاربر "))
+            {
+                var parts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 4 && decimal.TryParse(parts[3], out var fineAmt) && fineAmt > 0)
+                {
+                    var targetInput = parts[2];
+                    string reason = parts.Length > 4 ? string.Join(" ", parts.Skip(4)) : "تخلف قوانین معاملات";
+                    User? target = FindUserByIdOrUsernameOrRank(targetInput, out _);
+                    if (target != null)
+                    {
+                        lock (_dataLock)
+                        {
+                            target.Balance = Math.Max(0m, target.Balance - fineAmt);
+                        }
+                        RequestSave();
+                        await bot.SendMessage(chatId, $"✅ مبلغ {FmtMoney(fineAmt)} دلار به عنوان جریمه از حساب کاربر @{target.Username} (ID: {target.UserId}) کسر شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                        try { _ = Bot.SendMessage(target.UserId, $"⚖️ **اخطاریه رسمی مدیریت سرور:**\nمبلغ **{FmtMoney(fineAmt)}** به علت **«{reason}»** از حساب کاربری شما به عنوان جریمه کسر شد.", parseMode: ParseMode.Markdown); } catch { }
+                    }
+                    else
+                    {
+                        await bot.SendMessage(chatId, "❌ کاربر مورد نظر یافت نشد.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                    }
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, "❌ فرمت دستور نادرست است. مثال: جریمه کاربر #1 2500 دستکاری بازار", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                }
             }
             else if (text == "📈 تنظیم قیمت دستی")
             {
@@ -3280,7 +3370,40 @@ namespace StockBotApp
                 InlineKeyboardButton.WithCallbackData("🔄 به‌روزرسانی پرتفو", "REFRESH_PORTFOLIO")
             });
 
-            await bot.SendMessage(chatId, msg, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
+            if (holdings.Count > 0)
+            {
+                try
+                {
+                    var plt = new Plot();
+                    var slices = new List<PieSlice>();
+                    slices.Add(new PieSlice((double)balance, $"Cash ({balance / netWorth * 100:N1}%)", ScottPlot.Color.FromHex("#2ca02c")));
+                    string[] palette = { "#1f77b4", "#ff7f0e", "#d62728", "#9467bd", "#8c564b", "#e377c2" };
+                    int cIdx = 0;
+                    foreach (var h in holdings)
+                    {
+                        double pct = (double)(h.Value / netWorth) * 100;
+                        slices.Add(new PieSlice((double)h.Value, $"{h.Symbol} ({pct:N1}%)", ScottPlot.Color.FromHex(palette[cIdx % palette.Length])));
+                        cIdx++;
+                    }
+                    var pie = plt.Add.Pie(slices);
+                    pie.ExplodeFraction = 0.03;
+                    plt.Title($"Asset Allocation — @{uCopy.Username}");
+                    string piePath = $"portfolio_{userId}_{DateTime.UtcNow.Ticks}.png";
+                    await Task.Run(() => plt.SavePng(piePath, 600, 400), ct);
+
+                    await using var stream = IOFile.OpenRead(piePath);
+                    await bot.SendPhoto(chatId, InputFile.FromStream(stream, piePath), caption: msg, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
+                    try { IOFile.Delete(piePath); } catch { }
+                }
+                catch
+                {
+                    await bot.SendMessage(chatId, msg, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
+                }
+            }
+            else
+            {
+                await bot.SendMessage(chatId, msg, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
+            }
         }
 
         private static async Task SendSymbolCardAsync(ITelegramBotClient bot, long chatId, string symbol, CancellationToken ct)
@@ -3621,10 +3744,53 @@ namespace StockBotApp
                 double[] ys = prices.Select(p => (double)p).ToArray();
 
                 var plt = new Plot();
-                var scatter = plt.Add.Scatter(xs, ys);
-                scatter.LineWidth = 2.5f;
-                scatter.MarkerSize = prices.Length > 35 ? 3 : 6;
-                scatter.Color = ScottPlot.Color.FromHex("#1f77b4");
+                if (prices.Length >= 4)
+                {
+                    var ohlcList = new List<ScottPlot.OHLC>();
+                    int numCandles = Math.Min(30, Math.Max(5, prices.Length / 2));
+                    double totalSec = Math.Max(3600, (endDt - startDt).TotalSeconds);
+                    double candleSpanSec = totalSec / numCandles;
+                    TimeSpan candleSpan = TimeSpan.FromSeconds(candleSpanSec);
+
+                    for (int i = 0; i < numCandles; i++)
+                    {
+                        DateTime cStart = startDt.AddSeconds(i * candleSpanSec);
+                        DateTime cEnd = startDt.AddSeconds((i + 1) * candleSpanSec);
+                        var bucket = new List<double>();
+                        for (int j = 0; j < timePoints.Length; j++)
+                        {
+                            if (timePoints[j] >= cStart && timePoints[j] <= cEnd)
+                                bucket.Add((double)prices[j]);
+                        }
+                        if (bucket.Count > 0)
+                        {
+                            double o = bucket.First();
+                            double cPrice = bucket.Last();
+                            double h = bucket.Max();
+                            double l = bucket.Min();
+                            ohlcList.Add(new ScottPlot.OHLC(o, h, l, cPrice, cStart, candleSpan));
+                        }
+                    }
+
+                    if (ohlcList.Count >= 2)
+                    {
+                        _ = plt.Add.Candlestick(ohlcList);
+                    }
+                    else
+                    {
+                        var scatter = plt.Add.Scatter(xs, ys);
+                        scatter.LineWidth = 2.5f;
+                        scatter.MarkerSize = 7;
+                        scatter.Color = ScottPlot.Color.FromHex("#1f77b4");
+                    }
+                }
+                else
+                {
+                    var scatter = plt.Add.Scatter(xs, ys);
+                    scatter.LineWidth = 2.5f;
+                    scatter.MarkerSize = 7;
+                    scatter.Color = ScottPlot.Color.FromHex("#1f77b4");
+                }
                 plt.Grid.MajorLineColor = ScottPlot.Colors.LightGray.WithAlpha(0.35);
 
                 plt.Axes.DateTimeTicksBottom(); // نمایش ساعت و تاریخ واقعی بدون هم‌پوشانی
@@ -3716,10 +3882,11 @@ namespace StockBotApp
             {
                 new KeyboardButton[] { "➕ اضافه کردن ارز", "📊 مرور بازار", "💰 موجودی کاربران" },
                 new KeyboardButton[] { "🎮 کنترل پنل دارایی پلیر", "🎁 واریز / مدیریت سهام", "🔄 ریست دارایی کاربر" },
-                new KeyboardButton[] { "🏦 تزریق نقدینگی", "🖼 تنظیم عکس ارز", "📝 تنظیم توضیحات ارز" },
-                new KeyboardButton[] { "🗑 حذف ارز", "📈 تنظیم قیمت دستی", "📋 سفارشات باز" },
-                new KeyboardButton[] { "🔄 ریست بازار", "🎲 رویداد تصادفی", "📰 رویدادهای ویژه" },
-                new KeyboardButton[] { "🏆 لیدربورد", "🔙 بازگشت به منوی اصلی" }
+                new KeyboardButton[] { "⚖️ جریمه مالی کاربر (Fine)", "🔒 توقف / بازگشایی نماد", "🏦 تزریق نقدینگی" },
+                new KeyboardButton[] { "🖼 تنظیم عکس ارز", "📝 تنظیم توضیحات ارز", "🗑 حذف ارز" },
+                new KeyboardButton[] { "📈 تنظیم قیمت دستی", "📋 سفارشات باز", "🔄 ریست بازار" },
+                new KeyboardButton[] { "🎲 رویداد تصادفی", "📰 رویدادهای ویژه", "🏆 لیدربورد" },
+                new KeyboardButton[] { "🔙 بازگشت به منوی اصلی" }
             }) { ResizeKeyboard = true };
         }
 
