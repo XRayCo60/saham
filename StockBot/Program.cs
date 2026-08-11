@@ -985,6 +985,19 @@ namespace StockBotApp
             return ownerCmds.Contains(text) || text.StartsWith("واریز سهام") || text.StartsWith("برداشت سهام") || text.StartsWith("واریز دلار") || text.StartsWith("برداشت دلار") || text.StartsWith("کنترل پلیر") || text.StartsWith("جریمه کاربر") || text.StartsWith("توقف نماد") || text.StartsWith("بازگشایی نماد");
         }
 
+        private static bool IsSymbolHalted(string symbol, long userId)
+        {
+            if (userId == OwnerId) return false;
+            lock (_dataLock)
+            {
+                if (Market.TryGetValue(symbol.ToUpper(), out var c))
+                {
+                    return c.IsHalted;
+                }
+            }
+            return false;
+        }
+
         private static async Task<bool> HandleStateAsync(ITelegramBotClient bot, Message message, string state, CancellationToken ct)
         {
             var chatId = message.Chat.Id;
@@ -994,6 +1007,19 @@ namespace StockBotApp
             {
                 UserStates.Remove(chatId);
                 await bot.SendMessage(chatId, "❌ عملیات لغو شد.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                return true;
+            }
+
+            string? haltStateSymbol = null;
+            if (state.StartsWith("LIMIT_BUY_QTY_") || state.StartsWith("LIMIT_SELL_QTY_") || state.StartsWith("CUSTOM_BUY_QTY_") || state.StartsWith("CUSTOM_SELL_QTY_"))
+                haltStateSymbol = state.Split('_')[3];
+            else if (state.StartsWith("LIMIT_BUY_PRICE_") || state.StartsWith("LIMIT_SELL_PRICE_"))
+                haltStateSymbol = state.Split('_')[3];
+
+            if (haltStateSymbol != null && IsSymbolHalted(haltStateSymbol, chatId))
+            {
+                await bot.SendMessage(chatId, $"🔒 معاملات نماد {haltStateSymbol.ToUpper()} موقتاً توسط مدیریت متوقف شده است و امکان ثبت سفارش وجود ندارد.", cancellationToken: ct);
+                UserStates.Remove(chatId);
                 return true;
             }
 
@@ -1192,7 +1218,7 @@ namespace StockBotApp
                     return true;
                 }
             }
-            else if (state == "ADM_CTRL_SELECT_USER" || state == "ADM_RESET_USER")
+            else if (state == "ADM_CTRL_SELECT_USER" || state == "ADM_RESET_USER" || state == "ADM_SELECT_USER")
             {
                 var target = FindUserByIdOrUsernameOrRank(text, out _);
                 if (target != null)
@@ -1202,6 +1228,92 @@ namespace StockBotApp
                 else
                 {
                     await bot.SendMessage(chatId, "❌ پلیر مورد نظر یافت نشد.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                }
+                UserStates.Remove(chatId);
+                return true;
+            }
+            else if (state == "ADM_TOGGLE_HALT")
+            {
+                var symbol = text.Trim().ToUpper();
+                bool success = false;
+                bool haltedNow = false;
+                lock (_dataLock)
+                {
+                    if (Market.TryGetValue(symbol, out var c))
+                    {
+                        c.IsHalted = !c.IsHalted;
+                        haltedNow = c.IsHalted;
+                        success = true;
+                    }
+                }
+                if (success)
+                {
+                    RequestSave();
+                    string status = haltedNow ? "🔒 متوقف (Halted)" : "🟢 فعال (Active)";
+                    await bot.SendMessage(chatId, $"✅ وضعیت معاملات نماد {symbol} به «{status}» تغییر یافت.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, $"❌ نماد {symbol} یافت نشد.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                }
+                UserStates.Remove(chatId);
+                return true;
+            }
+            else if (state == "ADM_FINE_USER_SELECT")
+            {
+                var target = FindUserByIdOrUsernameOrRank(text, out _);
+                if (target != null)
+                {
+                    UserStates[chatId] = $"ADM_FINE_AMT_{target.UserId}";
+                    await bot.SendMessage(chatId, $"⚖️ کاربر @{target.Username} (ID: {target.UserId}) انتخاب شد.\n\n" +
+                                                  $"💵 لطفاً مبلغ جریمه مالی (دلار) را وارد کنید (مثال: `1000`):", cancellationToken: ct);
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, "❌ پلیر مورد نظر یافت نشد.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                    UserStates.Remove(chatId);
+                }
+                return true;
+            }
+            else if (state.StartsWith("ADM_FINE_AMT_"))
+            {
+                var targetId = long.Parse(state.Split('_')[3]);
+                if (decimal.TryParse(text, out var amt) && amt > 0)
+                {
+                    UserStates[chatId] = $"ADM_FINE_REASON_{targetId}_{amt}";
+                    await bot.SendMessage(chatId, $"💵 مبلغ جریمه: {FmtMoney(amt)}\n\n" +
+                                                  $"📝 لطفاً علت جریمه (تخلف کاربر) را بنویسید (مثال: `دستکاری در قیمت بازار`):", cancellationToken: ct);
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, "❌ مبلغ نامعتبر است. لطفاً عدد مثبت وارد کنید:", cancellationToken: ct);
+                }
+                return true;
+            }
+            else if (state.StartsWith("ADM_FINE_REASON_"))
+            {
+                var parts = state.Split('_');
+                var targetId = long.Parse(parts[3]);
+                var amt = decimal.Parse(parts[4]);
+                string reason = text.Trim();
+                User? target = null;
+                lock (_dataLock)
+                {
+                    if (Users.TryGetValue(targetId, out var u))
+                    {
+                        u.Balance = Math.Max(0m, u.Balance - amt);
+                        target = u;
+                    }
+                }
+                if (target != null)
+                {
+                    RequestSave();
+                    await bot.SendMessage(chatId, $"✅ مبلغ {FmtMoney(amt)} دلار به عنوان جریمه از حساب کاربر @{target.Username} (ID: {target.UserId}) به علت «{reason}» کسر شد!", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
+                    try { _ = Bot.SendMessage(target.UserId, $"⚖️ **اخطاریه رسمی مدیریت سرور:**\nمبلغ **{FmtMoney(amt)}** به علت **«{reason}»** از حساب کاربری شما به عنوان جریمه کسر شد.", parseMode: ParseMode.Markdown); } catch { }
+                }
+                else
+                {
+                    await bot.SendMessage(chatId, "❌ کاربر یافت نشد.", replyMarkup: GetOwnerKeyboard(), cancellationToken: ct);
                 }
                 UserStates.Remove(chatId);
                 return true;
@@ -2215,7 +2327,7 @@ namespace StockBotApp
             {
                 await SendLeaderboardAsync(bot, chatId, OwnerId, ct);
             }
-            else if (text == "🎮 کنترل پنل دارایی پلیر" || text == "کنترل پلیر" || text == "مدیریت پلیر")
+            else if (text == "🎮 کنترل پنل دارایی پلیر" || text == "کنترل پلیر" || text == "مدیریت پلیر" || text == "🔄 ریست دارایی کاربر")
             {
                 UserStates[chatId] = "ADM_CTRL_SELECT_USER";
                 string info = "🎮 **کنترل پنل پیشرفته دارایی پلیر (God-Mode Player Control):**\n\n" +
@@ -2608,6 +2720,20 @@ namespace StockBotApp
                     Users[userId] = u;
                 }
                 user = u;
+            }
+
+            string? checkSymbolHalt = null;
+            if (data.StartsWith("LIMIT_BUY_INPUT_") || data.StartsWith("LIMIT_SELL_INPUT_") || data.StartsWith("CUSTOM_BUY_INPUT_") || data.StartsWith("CUSTOM_SELL_INPUT_"))
+                checkSymbolHalt = data.Split('_')[3];
+            else if (data.StartsWith("BUY_MENU_") || data.StartsWith("SELL_MENU_") || data.StartsWith("QUICK_BUY_") || data.StartsWith("QUICK_SELL_") || data.StartsWith("CONFIRM_BUY_") || data.StartsWith("CONFIRM_SELL_") || data.StartsWith("SELL_ALL_"))
+                checkSymbolHalt = data.Split('_')[2];
+            else if (data.StartsWith("BUY_") || data.StartsWith("SELL_"))
+                checkSymbolHalt = data.Split('_')[1];
+
+            if (checkSymbolHalt != null && IsSymbolHalted(checkSymbolHalt, userId))
+            {
+                await bot.SendMessage(chatId, $"🔒 معاملات نماد {checkSymbolHalt.ToUpper()} موقتاً توسط مدیریت متوقف شده است و امکان ثبت سفارش وجود ندارد.", cancellationToken: ct);
+                return;
             }
 
             if (data.StartsWith("VIEW_SYMBOL_"))
@@ -3152,7 +3278,8 @@ namespace StockBotApp
                 return;
             }
 
-            string msg = $"📋 تابلوی معاملات زنده — {cCopy.Symbol} ({cCopy.Description})\n\n" +
+            string haltTag = cCopy.IsHalted ? " [🔒 معاملات متوقف است]" : "";
+            string msg = $"📋 تابلوی معاملات زنده — {cCopy.Symbol} ({cCopy.Description}){haltTag}\n\n" +
                          $"💵 آخرین قیمت معامله: {FmtPrice(curPrice)}\n" +
                          $"💎 قیمت پایه اولیه: {FmtPrice(cCopy.BaseValue)}\n" +
                          $"🏦 سهام باقی‌مانده خزانه: {ipoLeft:N0} واحد\n\n" +
@@ -3370,30 +3497,43 @@ namespace StockBotApp
                 InlineKeyboardButton.WithCallbackData("🔄 به‌روزرسانی پرتفو", "REFRESH_PORTFOLIO")
             });
 
-            if (holdings.Count > 0)
+            if (holdings.Count > 0 && netWorth > 0)
             {
                 try
                 {
                     var plt = new Plot();
                     var slices = new List<PieSlice>();
-                    slices.Add(new PieSlice((double)balance, $"Cash ({balance / netWorth * 100:N1}%)", ScottPlot.Color.FromHex("#2ca02c")));
+                    if (balance > 0)
+                    {
+                        slices.Add(new PieSlice((double)balance, $"Cash ({(balance / netWorth) * 100:N1}%)", ScottPlot.Color.FromHex("#2ca02c")));
+                    }
                     string[] palette = { "#1f77b4", "#ff7f0e", "#d62728", "#9467bd", "#8c564b", "#e377c2" };
                     int cIdx = 0;
                     foreach (var h in holdings)
                     {
-                        double pct = (double)(h.Value / netWorth) * 100;
-                        slices.Add(new PieSlice((double)h.Value, $"{h.Symbol} ({pct:N1}%)", ScottPlot.Color.FromHex(palette[cIdx % palette.Length])));
-                        cIdx++;
+                        if (h.Value > 0)
+                        {
+                            double pct = (double)((h.Value / netWorth) * 100m);
+                            slices.Add(new PieSlice((double)h.Value, $"{h.Symbol} ({pct:N1}%)", ScottPlot.Color.FromHex(palette[cIdx % palette.Length])));
+                            cIdx++;
+                        }
                     }
-                    var pie = plt.Add.Pie(slices);
-                    pie.ExplodeFraction = 0.03;
-                    plt.Title($"Asset Allocation — @{uCopy.Username}");
-                    string piePath = $"portfolio_{userId}_{DateTime.UtcNow.Ticks}.png";
-                    await Task.Run(() => plt.SavePng(piePath, 600, 400), ct);
+                    if (slices.Count > 0)
+                    {
+                        var pie = plt.Add.Pie(slices);
+                        pie.ExplodeFraction = 0.03;
+                        plt.Title($"Asset Allocation — @{uCopy.Username}");
+                        string piePath = $"portfolio_{userId}_{Guid.NewGuid():N}.png";
+                        await Task.Run(() => plt.SavePng(piePath, 600, 400), ct);
 
-                    await using var stream = IOFile.OpenRead(piePath);
-                    await bot.SendPhoto(chatId, InputFile.FromStream(stream, piePath), caption: msg, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
-                    try { IOFile.Delete(piePath); } catch { }
+                        await using var stream = IOFile.OpenRead(piePath);
+                        await bot.SendPhoto(chatId, InputFile.FromStream(stream, piePath), caption: msg, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
+                        try { IOFile.Delete(piePath); } catch { }
+                    }
+                    else
+                    {
+                        await bot.SendMessage(chatId, msg, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: ct);
+                    }
                 }
                 catch
                 {
@@ -3694,7 +3834,12 @@ namespace StockBotApp
                     {
                         subset = c.TimedPriceHistory.TakeLast(30).ToList();
                     }
-                    if (subset.Count == 1)
+                    if (subset.Count == 0)
+                    {
+                        subset.Add(new PricePoint { Timestamp = DateTime.UtcNow.AddMinutes(-30), Price = c.BaseValue });
+                        subset.Add(new PricePoint { Timestamp = DateTime.UtcNow, Price = curPrice });
+                    }
+                    else if (subset.Count == 1)
                     {
                         subset.Insert(0, new PricePoint { Timestamp = subset[0].Timestamp.AddMinutes(-30), Price = c.BaseValue });
                     }
@@ -3799,7 +3944,7 @@ namespace StockBotApp
                 plt.YLabel("Price ($ USD)");
                 plt.Axes.Left.Label.Text = "Price ($)";
 
-                string filePath = $"{symbol}_chart_{DateTime.UtcNow.Ticks}.png";
+                string filePath = $"{symbol}_chart_{Guid.NewGuid():N}.png";
                 await Task.Run(() => plt.SavePng(filePath, 800, 400), ct);
 
                 await using var stream = IOFile.OpenRead(filePath);
@@ -3929,7 +4074,7 @@ namespace StockBotApp
         private static void MatchOrders(string symbol, long triggeredByUserId)
         {
             EnsureInitialLiquidity(symbol);
-            if (!Market.TryGetValue(symbol, out var currency)) return;
+            if (!Market.TryGetValue(symbol, out var currency) || currency.IsHalted) return;
             var buys = currency.Orders.Where(o => o.Type == "BUY" && o.Quantity > 0).OrderByDescending(o => o.Price).ToList();
             var sells = currency.Orders.Where(o => o.Type == "SELL" && o.Quantity > 0).OrderBy(o => o.Price).ToList();
 
